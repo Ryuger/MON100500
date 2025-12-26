@@ -737,15 +737,6 @@ class PingApp(tk.Tk):
         self.group_combo.pack(side=tk.LEFT, padx=5)
         self.group_combo.bind("<<ComboboxSelected>>", self.on_group_select)
 
-        self.group_active_var = tk.BooleanVar(value=False)
-        self.group_active_check = ttk.Checkbutton(
-            toolbar,
-            text="Мониторинг группы",
-            variable=self.group_active_var,
-            command=self.toggle_selected_group_active,
-        )
-        self.group_active_check.pack(side=tk.LEFT, padx=5)
-
         ttk.Button(toolbar, text="Создать", command=self.create_group_dialog).pack(
             side=tk.LEFT, padx=2
         )
@@ -972,7 +963,7 @@ class PingApp(tk.Tk):
         self.stats_tree.heading("offline", text="Недоступно")
         self.stats_tree.heading("unknown", text="Неизвестно")
 
-        self.stats_tree.column("active", width=95)
+        self.stats_tree.column("active", width=95, anchor="center")
         self.stats_tree.column("status", width=25)
         self.stats_tree.column("group", width=150)
         self.stats_tree.column("total", width=100)
@@ -985,7 +976,7 @@ class PingApp(tk.Tk):
         self.stats_tree.tag_configure("status_critical", foreground="#e74c3c")
 
         self.stats_tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.stats_tree.bind("<Double-1>", self.toggle_group_active)
+        self.stats_tree.bind("<Button-1>", self.toggle_group_active)
 
         self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_change)
 
@@ -1007,7 +998,7 @@ class PingApp(tk.Tk):
                 "",
                 "end",
                 values=(
-                    "Вкл" if active_map.get(s["group"], True) else "Выкл",
+                    "☑" if active_map.get(s["group"], False) else "☐",
                     "●",
                     s["group"],
                     s["total"],
@@ -1021,6 +1012,10 @@ class PingApp(tk.Tk):
         self.update_overall_status()
 
     def toggle_group_active(self, event):
+        region = self.stats_tree.identify("region", event.x, event.y)
+        column = self.stats_tree.identify_column(event.x)
+        if region != "cell" or column != "#1":
+            return
         item_id = self.stats_tree.identify_row(event.y)
         if not item_id:
             return
@@ -1029,7 +1024,7 @@ class PingApp(tk.Tk):
             return
         group = values[2]
         active_map = self.db.get_groups_with_status()
-        current = active_map.get(group, True)
+        current = active_map.get(group, False)
         self.db.set_group_active(group, not current)
         self.refresh_stats()
 
@@ -1087,21 +1082,7 @@ class PingApp(tk.Tk):
         self.current_group = self.group_combo.get()
         self.selected_host = None
         self.reset_detail_panel()
-        self.sync_group_active_state()
         self.refresh_table()
-
-    def sync_group_active_state(self):
-        if not self.current_group:
-            self.group_active_var.set(False)
-            return
-        active_map = self.db.get_groups_with_status()
-        self.group_active_var.set(active_map.get(self.current_group, False))
-
-    def toggle_selected_group_active(self):
-        if not self.current_group:
-            return
-        self.db.set_group_active(self.current_group, self.group_active_var.get())
-        self.refresh_stats()
 
     def create_group_dialog(self):
         def build_window():
@@ -1718,6 +1699,12 @@ class PingApp(tk.Tk):
             self.btn_start.configure(text="Старт")
             self.status_var.set("Мониторинг остановлен")
         else:
+            if not self.db.get_active_groups():
+                messagebox.showwarning(
+                    "Внимание",
+                    "Нет активных групп для мониторинга. Включите группы на вкладке 'Статистика'.",
+                )
+                return
             self.monitoring = True
             self.btn_start.configure(text="Стоп")
             self.status_var.set("Мониторинг запущен...")
