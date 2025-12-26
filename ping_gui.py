@@ -1610,14 +1610,14 @@ class PingApp(tk.Tk):
         segment = []
         for point in points:
             if point is None:
-                if len(segment) > 1:
+                if len(segment) >= 4:
                     self.chart_canvas.create_line(
                         segment, fill="#60a5fa", width=2, smooth=True
                     )
                 segment = []
             else:
                 segment.extend(point)
-        if len(segment) > 1:
+        if len(segment) >= 4:
             self.chart_canvas.create_line(
                 segment, fill="#60a5fa", width=2, smooth=True
             )
