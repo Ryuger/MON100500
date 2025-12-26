@@ -71,7 +71,7 @@ class DatabaseManager:
                 """
                 CREATE TABLE IF NOT EXISTS groups (
                     group_name TEXT PRIMARY KEY,
-                    active INTEGER DEFAULT 1
+                    active INTEGER DEFAULT 0
                 )
             """
             )
@@ -142,7 +142,7 @@ class DatabaseManager:
         self.cursor.execute("PRAGMA table_info(groups)")
         columns = [row[1] for row in self.cursor.fetchall()]
         if "active" not in columns:
-            self.cursor.execute("ALTER TABLE groups ADD COLUMN active INTEGER DEFAULT 1")
+            self.cursor.execute("ALTER TABLE groups ADD COLUMN active INTEGER DEFAULT 0")
             self.conn.commit()
 
     def migrate_legacy_tables(self):
@@ -193,7 +193,7 @@ class DatabaseManager:
         group_name = clean_group_name(group_name)
         with self.lock:
             self.cursor.execute(
-                "INSERT OR IGNORE INTO groups (group_name, active) VALUES (?, 1)",
+                "INSERT OR IGNORE INTO groups (group_name, active) VALUES (?, 0)",
                 (group_name,),
             )
             self.conn.commit()
@@ -605,6 +605,10 @@ class PingApp(tk.Tk):
         self.ui_queue = queue.Queue()
         self.last_stats_refresh = 0
         self.selected_host = None
+        self.settings_dialog = None
+        self.add_host_window = None
+        self.edit_host_window = None
+        self.create_group_window = None
 
         self.load_settings()
         self.create_widgets()
@@ -701,6 +705,16 @@ class PingApp(tk.Tk):
             foreground=[("readonly", "#e5e7eb")],
         )
 
+    def show_single_window(self, window_ref, create_callback):
+        if window_ref is not None and window_ref.winfo_exists():
+            window_ref.lift()
+            window_ref.focus_force()
+            return window_ref
+        window_ref = create_callback()
+        window_ref.lift()
+        window_ref.focus_force()
+        return window_ref
+
     def load_settings(self):
         self.default_interval_seconds = int(
             self.db.get_setting("default_interval_seconds", DEFAULT_PING_INTERVAL)
@@ -722,6 +736,15 @@ class PingApp(tk.Tk):
         self.group_combo = ttk.Combobox(toolbar, state="readonly", width=20)
         self.group_combo.pack(side=tk.LEFT, padx=5)
         self.group_combo.bind("<<ComboboxSelected>>", self.on_group_select)
+
+        self.group_active_var = tk.BooleanVar(value=False)
+        self.group_active_check = ttk.Checkbutton(
+            toolbar,
+            text="Мониторинг группы",
+            variable=self.group_active_var,
+            command=self.toggle_selected_group_active,
+        )
+        self.group_active_check.pack(side=tk.LEFT, padx=5)
 
         ttk.Button(toolbar, text="Создать", command=self.create_group_dialog).pack(
             side=tk.LEFT, padx=2
@@ -1064,18 +1087,52 @@ class PingApp(tk.Tk):
         self.current_group = self.group_combo.get()
         self.selected_host = None
         self.reset_detail_panel()
+        self.sync_group_active_state()
         self.refresh_table()
 
+    def sync_group_active_state(self):
+        if not self.current_group:
+            self.group_active_var.set(False)
+            return
+        active_map = self.db.get_groups_with_status()
+        self.group_active_var.set(active_map.get(self.current_group, False))
+
+    def toggle_selected_group_active(self):
+        if not self.current_group:
+            return
+        self.db.set_group_active(self.current_group, self.group_active_var.get())
+        self.refresh_stats()
+
     def create_group_dialog(self):
-        name = tk.simpledialog.askstring("Новая группа", "Введите имя группы:")
-        if name:
-            try:
-                self.db.create_group(name)
-                self.load_groups()
-                self.group_combo.set(name)
-                self.on_group_select(None)
-            except ValueError as e:
-                messagebox.showerror("Ошибка", str(e))
+        def build_window():
+            dialog = tk.Toplevel(self)
+            dialog.title("Новая группа")
+            dialog.geometry("300x160")
+            ttk.Label(dialog, text="Имя группы:").pack(pady=10)
+            name_var = tk.StringVar()
+            entry = ttk.Entry(dialog, textvariable=name_var, width=25)
+            entry.pack(pady=5)
+            entry.focus_set()
+
+            def save():
+                name = name_var.get()
+                if name:
+                    try:
+                        self.db.create_group(name)
+                        self.load_groups()
+                        self.group_combo.set(name)
+                        self.on_group_select(None)
+                        dialog.destroy()
+                    except ValueError as e:
+                        messagebox.showerror("Ошибка", str(e))
+
+            ttk.Button(dialog, text="Создать", command=save).pack(pady=10)
+            dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+            return dialog
+
+        self.create_group_window = self.show_single_window(
+            self.create_group_window, build_window
+        )
 
     def delete_group(self):
         if not self.current_group:
@@ -1089,48 +1146,52 @@ class PingApp(tk.Tk):
         if not self.current_group:
             messagebox.showwarning("Внимание", "Сначала создайте или выберите группу.")
             return
+        def build_window():
+            dialog = tk.Toplevel(self)
+            dialog.title("Добавить хост")
+            dialog.geometry("350x340")
 
-        dialog = tk.Toplevel(self)
-        dialog.title("Добавить хост")
-        dialog.geometry("350x340")
+            ttk.Label(dialog, text="Адрес (IP/Домен):").pack(pady=5)
+            addr_entry = ttk.Entry(dialog, width=30)
+            addr_entry.pack(pady=5)
 
-        ttk.Label(dialog, text="Адрес (IP/Домен):").pack(pady=5)
-        addr_entry = ttk.Entry(dialog, width=30)
-        addr_entry.pack(pady=5)
+            ttk.Label(dialog, text="Описание:").pack(pady=5)
+            desc_entry = ttk.Entry(dialog, width=30)
+            desc_entry.pack(pady=5)
 
-        ttk.Label(dialog, text="Описание:").pack(pady=5)
-        desc_entry = ttk.Entry(dialog, width=30)
-        desc_entry.pack(pady=5)
+            ttk.Label(dialog, text="Подгруппа (необязательно):").pack(pady=5)
+            sub_entry = ttk.Entry(dialog, width=30)
+            sub_entry.pack(pady=5)
 
-        ttk.Label(dialog, text="Подгруппа (необязательно):").pack(pady=5)
-        sub_entry = ttk.Entry(dialog, width=30)
-        sub_entry.pack(pady=5)
+            ttk.Label(dialog, text="Интервал пинга (секунды):").pack(pady=5)
+            interval_var = tk.StringVar(value=str(self.default_interval_seconds))
+            interval_entry = ttk.Entry(dialog, width=30, textvariable=interval_var)
+            interval_entry.pack(pady=5)
 
-        ttk.Label(dialog, text="Интервал пинга (секунды):").pack(pady=5)
-        interval_var = tk.StringVar(value=str(self.default_interval_seconds))
-        interval_entry = ttk.Entry(dialog, width=30, textvariable=interval_var)
-        interval_entry.pack(pady=5)
+            def save():
+                try:
+                    interval_seconds = int(interval_var.get())
+                    if interval_seconds <= 0:
+                        raise ValueError("Интервал должен быть больше 0 секунд.")
+                    self.db.add_host(
+                        self.current_group,
+                        addr_entry.get(),
+                        desc_entry.get(),
+                        sub_entry.get() or None,
+                        interval_seconds,
+                    )
+                    self.refresh_table()
+                    dialog.destroy()
+                except ValueError as e:
+                    messagebox.showerror("Ошибка", str(e))
+                except sqlite3.Error as e:
+                    messagebox.showerror("Ошибка БД", str(e))
 
-        def save():
-            try:
-                interval_seconds = int(interval_var.get())
-                if interval_seconds <= 0:
-                    raise ValueError("Интервал должен быть больше 0 секунд.")
-                self.db.add_host(
-                    self.current_group,
-                    addr_entry.get(),
-                    desc_entry.get(),
-                    sub_entry.get() or None,
-                    interval_seconds,
-                )
-                self.refresh_table()
-                dialog.destroy()
-            except ValueError as e:
-                messagebox.showerror("Ошибка", str(e))
-            except sqlite3.Error as e:
-                messagebox.showerror("Ошибка БД", str(e))
+            ttk.Button(dialog, text="Сохранить", command=save).pack(pady=10)
+            dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+            return dialog
 
-        ttk.Button(dialog, text="Сохранить", command=save).pack(pady=10)
+        self.add_host_window = self.show_single_window(self.add_host_window, build_window)
 
     def edit_host_dialog(self):
         if not self.current_group:
@@ -1150,52 +1211,59 @@ class PingApp(tk.Tk):
         if not host_data:
             return
 
-        dialog = tk.Toplevel(self)
-        dialog.title("Редактировать хост")
-        dialog.geometry("350x340")
+        def build_window():
+            dialog = tk.Toplevel(self)
+            dialog.title("Редактировать хост")
+            dialog.geometry("350x340")
 
-        ttk.Label(dialog, text="Адрес (IP/Домен):").pack(pady=5)
-        addr_entry = ttk.Entry(dialog, width=30)
-        addr_entry.insert(0, host_data[0])
-        addr_entry.configure(state="disabled")
-        addr_entry.pack(pady=5)
+            ttk.Label(dialog, text="Адрес (IP/Домен):").pack(pady=5)
+            addr_entry = ttk.Entry(dialog, width=30)
+            addr_entry.insert(0, host_data[0])
+            addr_entry.configure(state="disabled")
+            addr_entry.pack(pady=5)
 
-        ttk.Label(dialog, text="Описание:").pack(pady=5)
-        desc_entry = ttk.Entry(dialog, width=30)
-        desc_entry.insert(0, host_data[1] or "")
-        desc_entry.pack(pady=5)
+            ttk.Label(dialog, text="Описание:").pack(pady=5)
+            desc_entry = ttk.Entry(dialog, width=30)
+            desc_entry.insert(0, host_data[1] or "")
+            desc_entry.pack(pady=5)
 
-        ttk.Label(dialog, text="Подгруппа (необязательно):").pack(pady=5)
-        sub_entry = ttk.Entry(dialog, width=30)
-        sub_entry.insert(0, host_data[2] or "")
-        sub_entry.pack(pady=5)
+            ttk.Label(dialog, text="Подгруппа (необязательно):").pack(pady=5)
+            sub_entry = ttk.Entry(dialog, width=30)
+            sub_entry.insert(0, host_data[2] or "")
+            sub_entry.pack(pady=5)
 
-        ttk.Label(dialog, text="Интервал пинга (секунды):").pack(pady=5)
-        interval_seconds = host_data[3] if host_data[3] else self.default_interval_seconds
-        interval_var = tk.StringVar(value=str(interval_seconds))
-        interval_entry = ttk.Entry(dialog, width=30, textvariable=interval_var)
-        interval_entry.pack(pady=5)
+            ttk.Label(dialog, text="Интервал пинга (секунды):").pack(pady=5)
+            interval_seconds = host_data[3] if host_data[3] else self.default_interval_seconds
+            interval_var = tk.StringVar(value=str(interval_seconds))
+            interval_entry = ttk.Entry(dialog, width=30, textvariable=interval_var)
+            interval_entry.pack(pady=5)
 
-        def save():
-            try:
-                interval_seconds = int(interval_var.get())
-                if interval_seconds <= 0:
-                    raise ValueError("Интервал должен быть больше 0 секунд.")
-                self.db.update_host(
-                    self.current_group,
-                    host_data[0],
-                    desc_entry.get(),
-                    sub_entry.get() or None,
-                    interval_seconds,
-                )
-                self.refresh_table()
-                dialog.destroy()
-            except ValueError as e:
-                messagebox.showerror("Ошибка", str(e))
-            except sqlite3.Error as e:
-                messagebox.showerror("Ошибка БД", str(e))
+            def save():
+                try:
+                    interval_seconds = int(interval_var.get())
+                    if interval_seconds <= 0:
+                        raise ValueError("Интервал должен быть больше 0 секунд.")
+                    self.db.update_host(
+                        self.current_group,
+                        host_data[0],
+                        desc_entry.get(),
+                        sub_entry.get() or None,
+                        interval_seconds,
+                    )
+                    self.refresh_table()
+                    dialog.destroy()
+                except ValueError as e:
+                    messagebox.showerror("Ошибка", str(e))
+                except sqlite3.Error as e:
+                    messagebox.showerror("Ошибка БД", str(e))
 
-        ttk.Button(dialog, text="Сохранить", command=save).pack(pady=10)
+            ttk.Button(dialog, text="Сохранить", command=save).pack(pady=10)
+            dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+            return dialog
+
+        self.edit_host_window = self.show_single_window(
+            self.edit_host_window, build_window
+        )
 
     def remove_host(self):
         selected_item = self.tree.selection()
@@ -1287,53 +1355,58 @@ class PingApp(tk.Tk):
                 messagebox.showerror("Ошибка", str(e))
 
     def open_settings_dialog(self):
-        dialog = tk.Toplevel(self)
-        dialog.title("Настройки")
-        dialog.geometry("360x320")
+        def build_window():
+            dialog = tk.Toplevel(self)
+            dialog.title("Настройки")
+            dialog.geometry("360x320")
 
-        fields = [
-            ("Интервал по умолчанию (сек)", "default_interval_seconds", self.default_interval_seconds),
-            ("Интервал цикла мониторинга (сек)", "monitor_interval_seconds", self.monitor_interval),
-            ("Таймаут пинга (сек)", "ping_timeout_seconds", self.ping_timeout),
-            ("Размер пачки пингов", "ping_batch_size", self.batch_size),
-            ("Макс. потоков пинга", "max_ping_workers", self.max_workers),
-        ]
+            fields = [
+                ("Интервал по умолчанию (сек)", "default_interval_seconds", self.default_interval_seconds),
+                ("Интервал цикла мониторинга (сек)", "monitor_interval_seconds", self.monitor_interval),
+                ("Таймаут пинга (сек)", "ping_timeout_seconds", self.ping_timeout),
+                ("Размер пачки пингов", "ping_batch_size", self.batch_size),
+                ("Макс. потоков пинга", "max_ping_workers", self.max_workers),
+            ]
 
-        entries = {}
-        for label, key, value in fields:
-            row = ttk.Frame(dialog)
-            row.pack(fill=tk.X, padx=10, pady=6)
-            ttk.Label(row, text=label).pack(side=tk.LEFT)
-            entry = ttk.Entry(row, width=10)
-            entry.insert(0, str(value))
-            entry.pack(side=tk.RIGHT)
-            entries[key] = entry
+            entries = {}
+            for label, key, value in fields:
+                row = ttk.Frame(dialog)
+                row.pack(fill=tk.X, padx=10, pady=6)
+                ttk.Label(row, text=label).pack(side=tk.LEFT)
+                entry = ttk.Entry(row, width=10)
+                entry.insert(0, str(value))
+                entry.pack(side=tk.RIGHT)
+                entries[key] = entry
 
-        def save():
-            try:
-                default_interval = int(entries["default_interval_seconds"].get())
-                monitor_interval = float(entries["monitor_interval_seconds"].get())
-                ping_timeout = float(entries["ping_timeout_seconds"].get())
-                batch_size = int(entries["ping_batch_size"].get())
-                max_workers = int(entries["max_ping_workers"].get())
+            def save():
+                try:
+                    default_interval = int(entries["default_interval_seconds"].get())
+                    monitor_interval = float(entries["monitor_interval_seconds"].get())
+                    ping_timeout = float(entries["ping_timeout_seconds"].get())
+                    batch_size = int(entries["ping_batch_size"].get())
+                    max_workers = int(entries["max_ping_workers"].get())
 
-                if default_interval <= 0 or monitor_interval <= 0 or ping_timeout <= 0:
-                    raise ValueError("Интервалы и таймаут должны быть больше 0.")
-                if batch_size <= 0 or max_workers <= 0:
-                    raise ValueError("Размеры должны быть больше 0.")
+                    if default_interval <= 0 or monitor_interval <= 0 or ping_timeout <= 0:
+                        raise ValueError("Интервалы и таймаут должны быть больше 0.")
+                    if batch_size <= 0 or max_workers <= 0:
+                        raise ValueError("Размеры должны быть больше 0.")
 
-                self.db.set_setting("default_interval_seconds", default_interval)
-                self.db.set_setting("monitor_interval_seconds", monitor_interval)
-                self.db.set_setting("ping_timeout_seconds", ping_timeout)
-                self.db.set_setting("ping_batch_size", batch_size)
-                self.db.set_setting("max_ping_workers", max_workers)
+                    self.db.set_setting("default_interval_seconds", default_interval)
+                    self.db.set_setting("monitor_interval_seconds", monitor_interval)
+                    self.db.set_setting("ping_timeout_seconds", ping_timeout)
+                    self.db.set_setting("ping_batch_size", batch_size)
+                    self.db.set_setting("max_ping_workers", max_workers)
 
-                self.load_settings()
-                dialog.destroy()
-            except ValueError as e:
-                messagebox.showerror("Ошибка", str(e))
+                    self.load_settings()
+                    dialog.destroy()
+                except ValueError as e:
+                    messagebox.showerror("Ошибка", str(e))
 
-        ttk.Button(dialog, text="Сохранить", command=save).pack(pady=10)
+            ttk.Button(dialog, text="Сохранить", command=save).pack(pady=10)
+            dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+            return dialog
+
+        self.settings_dialog = self.show_single_window(self.settings_dialog, build_window)
 
     def open_history_dialog(self):
         if not self.selected_host:
