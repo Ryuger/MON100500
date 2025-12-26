@@ -70,7 +70,8 @@ class DatabaseManager:
             self.cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS groups (
-                    group_name TEXT PRIMARY KEY
+                    group_name TEXT PRIMARY KEY,
+                    active INTEGER DEFAULT 1
                 )
             """
             )
@@ -135,6 +136,14 @@ class DatabaseManager:
                 ],
             )
             self.conn.commit()
+            self.ensure_groups_schema()
+
+    def ensure_groups_schema(self):
+        self.cursor.execute("PRAGMA table_info(groups)")
+        columns = [row[1] for row in self.cursor.fetchall()]
+        if "active" not in columns:
+            self.cursor.execute("ALTER TABLE groups ADD COLUMN active INTEGER DEFAULT 1")
+            self.conn.commit()
 
     def migrate_legacy_tables(self):
         with self.lock:
@@ -184,7 +193,8 @@ class DatabaseManager:
         group_name = clean_group_name(group_name)
         with self.lock:
             self.cursor.execute(
-                "INSERT OR IGNORE INTO groups (group_name) VALUES (?)", (group_name,)
+                "INSERT OR IGNORE INTO groups (group_name, active) VALUES (?, 1)",
+                (group_name,),
             )
             self.conn.commit()
         return group_name
@@ -202,6 +212,25 @@ class DatabaseManager:
     def get_groups(self):
         with self.lock:
             self.cursor.execute("SELECT group_name FROM groups")
+            return [row[0] for row in self.cursor.fetchall()]
+
+    def get_groups_with_status(self):
+        with self.lock:
+            self.cursor.execute("SELECT group_name, active FROM groups")
+            return {row[0]: bool(row[1]) for row in self.cursor.fetchall()}
+
+    def set_group_active(self, group_name, active):
+        group_name = clean_group_name(group_name)
+        with self.lock:
+            self.cursor.execute(
+                "UPDATE groups SET active = ? WHERE group_name = ?",
+                (1 if active else 0, group_name),
+            )
+            self.conn.commit()
+
+    def get_active_groups(self):
+        with self.lock:
+            self.cursor.execute("SELECT group_name FROM groups WHERE active = 1")
             return [row[0] for row in self.cursor.fetchall()]
 
     def get_setting(self, key, default=None):
@@ -620,9 +649,25 @@ class PingApp(tk.Tk):
     def apply_theme(self):
         self.style.configure("TFrame", background="#0b0f15")
         self.style.configure("TLabel", background="#0b0f15", foreground="#e5e7eb")
-        self.style.configure("TButton", padding=6)
+        self.style.configure(
+            "TButton",
+            padding=6,
+            background="#111827",
+            foreground="#e5e7eb",
+            bordercolor="#374151",
+        )
+        self.style.map(
+            "TButton",
+            background=[("active", "#1f2937"), ("pressed", "#1d4ed8")],
+            foreground=[("active", "#f9fafb")],
+        )
         self.style.configure("TNotebook", background="#0b0f15")
         self.style.configure("TNotebook.Tab", padding=[12, 6])
+        self.style.map(
+            "TNotebook.Tab",
+            background=[("selected", "#111827")],
+            foreground=[("selected", "#f9fafb")],
+        )
         self.style.configure(
             "Treeview",
             background="#111827",
@@ -638,6 +683,23 @@ class PingApp(tk.Tk):
         )
         self.style.map("Treeview", background=[("selected", "#1d4ed8")])
         self.style.configure("TSeparator", background="#1f2937")
+        self.style.configure(
+            "TEntry",
+            fieldbackground="#111827",
+            foreground="#e5e7eb",
+            insertcolor="#f9fafb",
+        )
+        self.style.configure(
+            "TCombobox",
+            fieldbackground="#111827",
+            foreground="#e5e7eb",
+            arrowcolor="#e5e7eb",
+        )
+        self.style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", "#111827")],
+            foreground=[("readonly", "#e5e7eb")],
+        )
 
     def load_settings(self):
         self.default_interval_seconds = int(
@@ -703,6 +765,24 @@ class PingApp(tk.Tk):
         )
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+
+        ttk.Label(toolbar, text="Фильтр:").pack(side=tk.LEFT, padx=5)
+        self.filter_var = tk.StringVar(value="all")
+        self.filter_combo = ttk.Combobox(
+            toolbar,
+            textvariable=self.filter_var,
+            state="readonly",
+            width=18,
+            values=[
+                "all",
+                "online",
+                "offline_lt_1h",
+                "offline_ge_1h",
+                "unknown",
+            ],
+        )
+        self.filter_combo.pack(side=tk.LEFT, padx=5)
+        self.filter_combo.bind("<<ComboboxSelected>>", lambda event: self.refresh_table())
 
         self.btn_start = ttk.Button(toolbar, text="Старт", command=self.toggle_monitoring)
         self.btn_start.pack(side=tk.LEFT, padx=5)
@@ -829,6 +909,12 @@ class PingApp(tk.Tk):
                 font=("Segoe UI", 11, "bold"),
             ).pack(anchor="w")
 
+        history_actions = ttk.Frame(detail_frame)
+        history_actions.pack(fill=tk.X, padx=10, pady=(10, 0))
+        ttk.Button(history_actions, text="История хоста", command=self.open_history_dialog).pack(
+            side=tk.LEFT
+        )
+
         ttk.Label(detail_frame, text="График задержек", font=("Segoe UI", 11, "bold")).pack(
             anchor="w", padx=10, pady=(16, 6)
         )
@@ -850,11 +936,12 @@ class PingApp(tk.Tk):
             side=tk.LEFT, padx=5
         )
 
-        columns = ("status", "group", "total", "online", "offline", "unknown")
+        columns = ("active", "status", "group", "total", "online", "offline", "unknown")
         self.stats_tree = ttk.Treeview(
             parent, columns=columns, show="headings", selectmode="browse"
         )
 
+        self.stats_tree.heading("active", text="Мониторинг")
         self.stats_tree.heading("status", text="")
         self.stats_tree.heading("group", text="Группа")
         self.stats_tree.heading("total", text="Всего хостов")
@@ -862,6 +949,7 @@ class PingApp(tk.Tk):
         self.stats_tree.heading("offline", text="Недоступно")
         self.stats_tree.heading("unknown", text="Неизвестно")
 
+        self.stats_tree.column("active", width=95)
         self.stats_tree.column("status", width=25)
         self.stats_tree.column("group", width=150)
         self.stats_tree.column("total", width=100)
@@ -874,6 +962,7 @@ class PingApp(tk.Tk):
         self.stats_tree.tag_configure("status_critical", foreground="#e74c3c")
 
         self.stats_tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.stats_tree.bind("<Double-1>", self.toggle_group_active)
 
         self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_change)
 
@@ -887,17 +976,39 @@ class PingApp(tk.Tk):
         for item in self.stats_tree.get_children():
             self.stats_tree.delete(item)
 
+        active_map = self.db.get_groups_with_status()
         stats = self.db.get_all_hosts_stats()
         for s in stats:
             tag = f"status_{s['status']}"
             self.stats_tree.insert(
                 "",
                 "end",
-                values=("●", s["group"], s["total"], s["online"], s["offline"], s["unknown"]),
+                values=(
+                    "Вкл" if active_map.get(s["group"], True) else "Выкл",
+                    "●",
+                    s["group"],
+                    s["total"],
+                    s["online"],
+                    s["offline"],
+                    s["unknown"],
+                ),
                 tags=(tag,),
             )
 
         self.update_overall_status()
+
+    def toggle_group_active(self, event):
+        item_id = self.stats_tree.identify_row(event.y)
+        if not item_id:
+            return
+        values = self.stats_tree.item(item_id)["values"]
+        if not values or len(values) < 3:
+            return
+        group = values[2]
+        active_map = self.db.get_groups_with_status()
+        current = active_map.get(group, True)
+        self.db.set_group_active(group, not current)
+        self.refresh_stats()
 
     def update_overall_status(self):
         overall = self.db.get_overall_status()
@@ -911,6 +1022,30 @@ class PingApp(tk.Tk):
     def clear_search(self):
         self.search_var.set("")
         self.refresh_table()
+
+    def match_filter(self, status, offline_since):
+        filter_value = self.filter_var.get()
+        if filter_value == "all":
+            return True
+        if filter_value == "unknown":
+            return status == "Unknown"
+        if filter_value == "online":
+            return status == "Online"
+        if filter_value.startswith("offline"):
+            if status != "Offline":
+                return False
+            if not offline_since:
+                return filter_value == "offline_lt_1h"
+            try:
+                offline_time = datetime.strptime(offline_since, "%Y-%m-%d %H:%M:%S")
+                diff = (datetime.now() - offline_time).total_seconds()
+            except ValueError:
+                diff = 3600
+            if filter_value == "offline_lt_1h":
+                return diff < 3600
+            if filter_value == "offline_ge_1h":
+                return diff >= 3600
+        return True
 
     def load_groups(self):
         groups = self.db.get_groups()
@@ -1200,6 +1335,58 @@ class PingApp(tk.Tk):
 
         ttk.Button(dialog, text="Сохранить", command=save).pack(pady=10)
 
+    def open_history_dialog(self):
+        if not self.selected_host:
+            messagebox.showwarning("Внимание", "Выберите хост.")
+            return
+        group, address = self.selected_host
+        dialog = tk.Toplevel(self)
+        dialog.title(f"История хоста {address}")
+        dialog.geometry("700x500")
+
+        ttk.Label(dialog, text=f"Группа: {group}", font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", padx=10, pady=(10, 5)
+        )
+
+        change_frame = ttk.LabelFrame(dialog, text="Смена статуса")
+        change_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        change_tree = ttk.Treeview(
+            change_frame, columns=("timestamp", "status"), show="headings", height=4
+        )
+        change_tree.heading("timestamp", text="Время")
+        change_tree.heading("status", text="Статус")
+        change_tree.column("timestamp", width=180)
+        change_tree.column("status", width=120)
+        change_tree.pack(fill=tk.X, padx=5, pady=5)
+
+        history_frame = ttk.LabelFrame(dialog, text="Полная история")
+        history_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        history_tree = ttk.Treeview(
+            history_frame,
+            columns=("timestamp", "status", "latency"),
+            show="headings",
+        )
+        history_tree.heading("timestamp", text="Время")
+        history_tree.heading("status", text="Статус")
+        history_tree.heading("latency", text="Задержка (мс)")
+        history_tree.column("timestamp", width=180)
+        history_tree.column("status", width=120)
+        history_tree.column("latency", width=120)
+
+        scrollbar = ttk.Scrollbar(history_frame, orient=tk.VERTICAL, command=history_tree.yview)
+        history_tree.configure(yscrollcommand=scrollbar.set)
+        history_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        results = self.db.get_recent_results(group, address, limit=200)
+        last_status = None
+        for timestamp, status, latency in results:
+            latency_ms = f"{latency * 1000:.0f}" if latency else "-"
+            history_tree.insert("", "end", values=(timestamp, status, latency_ms))
+            if status != last_status:
+                change_tree.insert("", "end", values=(timestamp, status))
+                last_status = status
+
     def get_status_color(self, address):
         if address not in self.host_status_cache:
             return "gray"
@@ -1240,6 +1427,8 @@ class PingApp(tk.Tk):
                     continue
 
             status = self.db.get_last_status(self.current_group, address)
+            if not self.match_filter(status, offline_since):
+                continue
 
             self.host_status_cache[address] = (status, offline_since)
 
@@ -1514,7 +1703,7 @@ class PingApp(tk.Tk):
 
     def monitoring_loop(self):
         while self.monitoring:
-            groups = self.db.get_groups()
+            groups = self.db.get_active_groups()
             if not groups:
                 time.sleep(self.monitor_interval)
                 continue
