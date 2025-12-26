@@ -6,10 +6,16 @@ import platform
 import threading
 import time
 import re
-import csv
 import queue
 import concurrent.futures
 from datetime import datetime
+
+try:
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.utils import get_column_letter
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
 
 DEFAULT_PING_INTERVAL = 600
 PING_BATCH_SIZE = 50
@@ -245,6 +251,22 @@ class DatabaseManager:
             row = self.cursor.fetchone()
             return row[0] if row else "Unknown"
 
+    def get_recent_results(self, group_name, address, limit=50):
+        group_name = clean_group_name(group_name)
+        address = clean_address(address)
+        with self.lock:
+            self.cursor.execute(
+                """
+                SELECT timestamp, status, latency
+                FROM ping_results
+                WHERE group_name = ? AND address = ?
+                ORDER BY id DESC
+                LIMIT ?
+            """,
+                (group_name, address, limit),
+            )
+            return list(reversed(self.cursor.fetchall()))
+
     def update_ping_time(self, group_name, address, status, commit=True):
         group_name = clean_group_name(group_name)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -473,6 +495,7 @@ class PingApp(tk.Tk):
         self.style = ttk.Style()
         self.style.theme_use("clam")
         self.configure(bg="#f0f0f0")
+        self.apply_theme()
 
         self.db = DatabaseManager()
         self.monitoring = False
@@ -482,11 +505,18 @@ class PingApp(tk.Tk):
         self.host_status_cache = {}
         self.ui_queue = queue.Queue()
         self.last_stats_refresh = 0
+        self.selected_host = None
 
         self.create_widgets()
         self.load_groups()
         self.update_overall_status()
         self.after(200, self.process_ui_queue)
+
+        if not HAS_OPENPYXL:
+            messagebox.showwarning(
+                "Внимание",
+                "openpyxl не установлен. Импорт/экспорт Excel будет недоступен.",
+            )
 
     def create_widgets(self):
         self.notebook = ttk.Notebook(self)
@@ -516,6 +546,28 @@ class PingApp(tk.Tk):
         status_bar = ttk.Label(self, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
+    def apply_theme(self):
+        self.style.configure("TFrame", background="#f7f9fc")
+        self.style.configure("TLabel", background="#f7f9fc", foreground="#1f2937")
+        self.style.configure("TButton", padding=6)
+        self.style.configure("TNotebook", background="#f7f9fc")
+        self.style.configure("TNotebook.Tab", padding=[12, 6])
+        self.style.configure(
+            "Treeview",
+            background="#ffffff",
+            fieldbackground="#ffffff",
+            foreground="#1f2937",
+            rowheight=26,
+        )
+        self.style.configure(
+            "Treeview.Heading",
+            background="#e5e7eb",
+            foreground="#111827",
+            font=("Segoe UI", 10, "bold"),
+        )
+        self.style.map("Treeview", background=[("selected", "#dbeafe")])
+        self.style.configure("TSeparator", background="#e5e7eb")
+
     def create_monitor_widgets(self, parent):
         toolbar = ttk.Frame(parent)
         toolbar.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
@@ -544,10 +596,10 @@ class PingApp(tk.Tk):
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
 
-        ttk.Button(toolbar, text="Экспорт (CSV)", command=self.export_data).pack(
+        ttk.Button(toolbar, text="Экспорт (Excel)", command=self.export_data).pack(
             side=tk.LEFT, padx=2
         )
-        ttk.Button(toolbar, text="Импорт (CSV)", command=self.import_data).pack(
+        ttk.Button(toolbar, text="Импорт (Excel)", command=self.import_data).pack(
             side=tk.LEFT, padx=2
         )
 
@@ -567,6 +619,17 @@ class PingApp(tk.Tk):
         self.btn_start = ttk.Button(toolbar, text="Старт", command=self.toggle_monitoring)
         self.btn_start.pack(side=tk.LEFT, padx=5)
 
+        content = ttk.Frame(parent)
+        content.pack(fill=tk.BOTH, expand=True)
+
+        paned = ttk.Panedwindow(content, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True)
+
+        table_frame = ttk.Frame(paned)
+        detail_frame = ttk.Frame(paned)
+        paned.add(table_frame, weight=3)
+        paned.add(detail_frame, weight=1)
+
         columns = (
             "status_indicator",
             "address",
@@ -577,7 +640,7 @@ class PingApp(tk.Tk):
             "last_check",
         )
         self.tree = ttk.Treeview(
-            parent, columns=columns, show="headings", selectmode="extended", height=20
+            table_frame, columns=columns, show="headings", selectmode="extended", height=20
         )
 
         self.tree.heading("status_indicator", text="")
@@ -596,7 +659,7 @@ class PingApp(tk.Tk):
         self.tree.column("latency", width=80)
         self.tree.column("last_check", width=130)
 
-        scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=self.tree.yview)
+        scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
 
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -606,6 +669,50 @@ class PingApp(tk.Tk):
         self.tree.tag_configure("status_yellow", foreground="#f39c12")
         self.tree.tag_configure("status_red", foreground="#e74c3c")
         self.tree.tag_configure("status_gray", foreground="#95a5a6")
+
+        self.tree.bind("<<TreeviewSelect>>", self.on_host_select)
+
+        ttk.Label(detail_frame, text="Детали хоста", font=("Segoe UI", 12, "bold")).pack(
+            anchor="w", padx=10, pady=(10, 6)
+        )
+
+        info_frame = ttk.Frame(detail_frame)
+        info_frame.pack(fill=tk.X, padx=10)
+
+        self.detail_vars = {
+            "address": tk.StringVar(value="—"),
+            "description": tk.StringVar(value="—"),
+            "subgroup": tk.StringVar(value="—"),
+            "interval": tk.StringVar(value="—"),
+            "status": tk.StringVar(value="—"),
+            "latency": tk.StringVar(value="—"),
+            "last_check": tk.StringVar(value="—"),
+        }
+
+        for label, key in [
+            ("Адрес:", "address"),
+            ("Описание:", "description"),
+            ("Подгруппа:", "subgroup"),
+            ("Интервал:", "interval"),
+            ("Статус:", "status"),
+            ("Задержка:", "latency"),
+            ("Последняя проверка:", "last_check"),
+        ]:
+            row = ttk.Frame(info_frame)
+            row.pack(fill=tk.X, pady=2)
+            ttk.Label(row, text=label, width=16, anchor="w").pack(side=tk.LEFT)
+            ttk.Label(row, textvariable=self.detail_vars[key], anchor="w").pack(
+                side=tk.LEFT, fill=tk.X, expand=True
+            )
+
+        ttk.Label(detail_frame, text="График задержек", font=("Segoe UI", 11, "bold")).pack(
+            anchor="w", padx=10, pady=(16, 6)
+        )
+        self.chart_canvas = tk.Canvas(
+            detail_frame, height=200, background="#ffffff", highlightthickness=1
+        )
+        self.chart_canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.chart_canvas.bind("<Configure>", lambda event: self.update_chart())
 
     def create_stats_widgets(self, parent):
         toolbar = ttk.Frame(parent)
@@ -692,6 +799,8 @@ class PingApp(tk.Tk):
 
     def on_group_select(self, event):
         self.current_group = self.group_combo.get()
+        self.selected_host = None
+        self.reset_detail_panel()
         self.refresh_table()
 
     def create_group_dialog(self):
@@ -843,20 +952,37 @@ class PingApp(tk.Tk):
         if not self.current_group:
             return
 
+        if not HAS_OPENPYXL:
+            messagebox.showerror("Ошибка", "openpyxl не установлен. Невозможно экспортировать.")
+            return
+
         filename = filedialog.asksaveasfilename(
-            defaultextension=".csv", filetypes=[("CSV Files", "*.csv")]
+            defaultextension=".xlsx", filetypes=[("Excel Files", "*.xlsx")]
         )
 
         if filename:
             try:
-                with open(filename, mode="w", newline="", encoding="utf-8") as file:
-                    writer = csv.writer(file)
-                    writer.writerow(["address", "description", "subgroup", "ping_interval_min"])
-                    hosts = self.db.get_hosts(self.current_group)
-                    for h in hosts:
-                        interval_min = h[3] // 60 if h[3] else 10
-                        writer.writerow([h[0], h[1], h[2] or "", interval_min])
-                messagebox.showinfo("Успех", "Данные экспортированы в CSV.")
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "hosts"
+
+                ws.append(["address", "description", "subgroup", "ping_interval_min"])
+                hosts = self.db.get_hosts(self.current_group)
+                for h in hosts:
+                    interval_min = h[3] // 60 if h[3] else 10
+                    ws.append([h[0], h[1], h[2] or "", interval_min])
+
+                for col in ws.columns:
+                    max_length = 0
+                    for cell in col:
+                        cell_value = str(cell.value) if cell.value is not None else ""
+                        if len(cell_value) > max_length:
+                            max_length = len(cell_value)
+                    adjusted_width = min(max_length + 2, 50)
+                    ws.column_dimensions[get_column_letter(col[0].column)].width = adjusted_width
+
+                wb.save(filename)
+                messagebox.showinfo("Успех", "Данные экспортированы в Excel.")
             except Exception as e:
                 messagebox.showerror("Ошибка", str(e))
 
@@ -865,23 +991,33 @@ class PingApp(tk.Tk):
             messagebox.showwarning("Внимание", "Выберите группу.")
             return
 
-        filename = filedialog.askopenfilename(filetypes=[("CSV Files", "*.csv")])
+        if not HAS_OPENPYXL:
+            messagebox.showerror("Ошибка", "openpyxl не установлен. Невозможно импортировать.")
+            return
+
+        filename = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsx")])
 
         if filename:
             try:
-                with open(filename, mode="r", encoding="utf-8") as file:
-                    reader = csv.DictReader(file)
-                    for row in reader:
-                        addr = row.get("address")
-                        desc = row.get("description", "")
-                        sub = row.get("subgroup") or None
-                        interval_min = int(row.get("ping_interval_min", 10) or 10)
+                wb = load_workbook(filename)
+                ws = wb.active
+
+                rows = list(ws.iter_rows(values_only=True))
+                if not rows:
+                    return
+
+                for row in rows[1:]:
+                    if row and len(row) >= 2:
+                        addr = row[0]
+                        desc = row[1]
+                        sub = row[2] if len(row) > 2 else None
+                        interval_min = int(row[3]) if len(row) > 3 and row[3] else 10
                         interval_sec = interval_min * 60
                         if addr:
                             self.db.add_host(self.current_group, addr, desc, sub, interval_sec)
 
                 self.refresh_table()
-                messagebox.showinfo("Успех", "Данные импортированы из CSV.")
+                messagebox.showinfo("Успех", "Данные импортированы из Excel.")
             except Exception as e:
                 messagebox.showerror("Ошибка", str(e))
 
@@ -944,6 +1080,78 @@ class PingApp(tk.Tk):
     def clear_table(self):
         for item in self.tree.get_children():
             self.tree.delete(item)
+
+    def reset_detail_panel(self):
+        for key in self.detail_vars:
+            self.detail_vars[key].set("—")
+        self.chart_canvas.delete("all")
+
+    def on_host_select(self, event):
+        selection = self.tree.selection()
+        if not selection:
+            return
+        item = self.tree.item(selection[0])
+        address = item["values"][1]
+        self.selected_host = (self.current_group, address)
+        self.update_detail_panel(address)
+        self.update_chart()
+
+    def update_detail_panel(self, address):
+        if not self.current_group or not address:
+            return
+        hosts = self.db.get_hosts(self.current_group)
+        host_map = {h[0]: h for h in hosts}
+        host_data = host_map.get(address)
+        if not host_data:
+            return
+
+        address, desc, subgroup, interval_sec, last_ping_time, _ = host_data
+        status = self.db.get_last_status(self.current_group, address)
+        latest_results = self.db.get_recent_results(self.current_group, address, limit=1)
+        latest_latency = latest_results[-1][2] if latest_results else None
+
+        self.detail_vars["address"].set(address)
+        self.detail_vars["description"].set(desc or "—")
+        self.detail_vars["subgroup"].set(subgroup or "—")
+        interval_min = interval_sec // 60 if interval_sec else 10
+        self.detail_vars["interval"].set(f"{interval_min} мин")
+        self.detail_vars["status"].set(status)
+        self.detail_vars["latency"].set(f"{latest_latency:.3f} сек" if latest_latency else "—")
+        self.detail_vars["last_check"].set(last_ping_time or "—")
+
+    def update_chart(self):
+        self.chart_canvas.delete("all")
+        if not self.selected_host:
+            return
+        group, address = self.selected_host
+        data = self.db.get_recent_results(group, address, limit=50)
+        if not data:
+            return
+
+        latencies = [row[2] for row in data if row[2] is not None]
+        if not latencies:
+            return
+
+        width = self.chart_canvas.winfo_width() or 300
+        height = self.chart_canvas.winfo_height() or 200
+        padding = 20
+        min_latency = min(latencies)
+        max_latency = max(latencies)
+        span = max(max_latency - min_latency, 0.001)
+
+        points = []
+        for idx, latency in enumerate(latencies):
+            x = padding + idx * (width - 2 * padding) / max(len(latencies) - 1, 1)
+            y = height - padding - (latency - min_latency) / span * (height - 2 * padding)
+            points.extend([x, y])
+
+        self.chart_canvas.create_line(
+            padding, height - padding, width - padding, height - padding, fill="#e5e7eb"
+        )
+        self.chart_canvas.create_line(
+            padding, padding, padding, height - padding, fill="#e5e7eb"
+        )
+        self.chart_canvas.create_line(points, fill="#2563eb", width=2, smooth=True)
 
     def toggle_monitoring(self):
         if self.monitoring:
@@ -1077,6 +1285,10 @@ class PingApp(tk.Tk):
                 )
                 self.tree.item(item_id, values=new_vals, tags=(tag,))
                 break
+
+        if self.selected_host == (group, address):
+            self.update_detail_panel(address)
+            self.update_chart()
 
     def process_ui_queue(self):
         try:
