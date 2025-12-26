@@ -18,8 +18,10 @@ except ImportError:
     HAS_OPENPYXL = False
 
 DEFAULT_PING_INTERVAL = 600
-PING_BATCH_SIZE = 50
-MAX_PING_WORKERS = 20
+DEFAULT_MONITOR_INTERVAL = 1
+DEFAULT_PING_TIMEOUT = 1
+DEFAULT_BATCH_SIZE = 50
+DEFAULT_MAX_WORKERS = 20
 STATS_REFRESH_INTERVAL = 5
 
 
@@ -111,6 +113,27 @@ class DatabaseManager:
                 ON ping_results (group_name, address)
             """
             )
+            self.cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """
+            )
+            self.cursor.executemany(
+                """
+                INSERT OR IGNORE INTO settings (key, value)
+                VALUES (?, ?)
+            """,
+                [
+                    ("default_interval_seconds", str(DEFAULT_PING_INTERVAL)),
+                    ("monitor_interval_seconds", str(DEFAULT_MONITOR_INTERVAL)),
+                    ("ping_timeout_seconds", str(DEFAULT_PING_TIMEOUT)),
+                    ("ping_batch_size", str(DEFAULT_BATCH_SIZE)),
+                    ("max_ping_workers", str(DEFAULT_MAX_WORKERS)),
+                ],
+            )
             self.conn.commit()
 
     def migrate_legacy_tables(self):
@@ -180,6 +203,24 @@ class DatabaseManager:
         with self.lock:
             self.cursor.execute("SELECT group_name FROM groups")
             return [row[0] for row in self.cursor.fetchall()]
+
+    def get_setting(self, key, default=None):
+        with self.lock:
+            self.cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+            row = self.cursor.fetchone()
+            return row[0] if row else default
+
+    def set_setting(self, key, value):
+        with self.lock:
+            self.cursor.execute(
+                """
+                INSERT INTO settings (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+                (key, str(value)),
+            )
+            self.conn.commit()
 
     def add_host(self, group_name, address, description, subgroup=None, ping_interval=DEFAULT_PING_INTERVAL):
         group_name = clean_group_name(group_name)
@@ -266,6 +307,31 @@ class DatabaseManager:
                 (group_name, address, limit),
             )
             return list(reversed(self.cursor.fetchall()))
+
+    def get_last_status_change(self, group_name, address, limit=200):
+        group_name = clean_group_name(group_name)
+        address = clean_address(address)
+        with self.lock:
+            self.cursor.execute(
+                """
+                SELECT timestamp, status
+                FROM ping_results
+                WHERE group_name = ? AND address = ?
+                ORDER BY id DESC
+                LIMIT ?
+            """,
+                (group_name, address, limit),
+            )
+            rows = self.cursor.fetchall()
+        if not rows:
+            return None, None
+        last_status = rows[0][1]
+        last_change_time = rows[0][0]
+        for timestamp, status in rows[1:]:
+            if status != last_status:
+                break
+            last_change_time = timestamp
+        return last_status, last_change_time
 
     def update_ping_time(self, group_name, address, status, commit=True):
         group_name = clean_group_name(group_name)
@@ -494,19 +560,24 @@ class PingApp(tk.Tk):
 
         self.style = ttk.Style()
         self.style.theme_use("clam")
-        self.configure(bg="#f0f0f0")
+        self.configure(bg="#0b0f15")
         self.apply_theme()
 
         self.db = DatabaseManager()
         self.monitoring = False
         self.monitor_thread = None
-        self.monitor_interval = 1.0
+        self.monitor_interval = DEFAULT_MONITOR_INTERVAL
+        self.ping_timeout = DEFAULT_PING_TIMEOUT
+        self.batch_size = DEFAULT_BATCH_SIZE
+        self.max_workers = DEFAULT_MAX_WORKERS
+        self.default_interval_seconds = DEFAULT_PING_INTERVAL
         self.current_group = None
         self.host_status_cache = {}
         self.ui_queue = queue.Queue()
         self.last_stats_refresh = 0
         self.selected_host = None
 
+        self.load_settings()
         self.create_widgets()
         self.load_groups()
         self.update_overall_status()
@@ -547,26 +618,39 @@ class PingApp(tk.Tk):
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
     def apply_theme(self):
-        self.style.configure("TFrame", background="#f7f9fc")
-        self.style.configure("TLabel", background="#f7f9fc", foreground="#1f2937")
+        self.style.configure("TFrame", background="#0b0f15")
+        self.style.configure("TLabel", background="#0b0f15", foreground="#e5e7eb")
         self.style.configure("TButton", padding=6)
-        self.style.configure("TNotebook", background="#f7f9fc")
+        self.style.configure("TNotebook", background="#0b0f15")
         self.style.configure("TNotebook.Tab", padding=[12, 6])
         self.style.configure(
             "Treeview",
-            background="#ffffff",
-            fieldbackground="#ffffff",
-            foreground="#1f2937",
+            background="#111827",
+            fieldbackground="#111827",
+            foreground="#e5e7eb",
             rowheight=26,
         )
         self.style.configure(
             "Treeview.Heading",
-            background="#e5e7eb",
-            foreground="#111827",
+            background="#1f2937",
+            foreground="#f9fafb",
             font=("Segoe UI", 10, "bold"),
         )
-        self.style.map("Treeview", background=[("selected", "#dbeafe")])
-        self.style.configure("TSeparator", background="#e5e7eb")
+        self.style.map("Treeview", background=[("selected", "#1d4ed8")])
+        self.style.configure("TSeparator", background="#1f2937")
+
+    def load_settings(self):
+        self.default_interval_seconds = int(
+            self.db.get_setting("default_interval_seconds", DEFAULT_PING_INTERVAL)
+        )
+        self.monitor_interval = float(
+            self.db.get_setting("monitor_interval_seconds", DEFAULT_MONITOR_INTERVAL)
+        )
+        self.ping_timeout = float(
+            self.db.get_setting("ping_timeout_seconds", DEFAULT_PING_TIMEOUT)
+        )
+        self.batch_size = int(self.db.get_setting("ping_batch_size", DEFAULT_BATCH_SIZE))
+        self.max_workers = int(self.db.get_setting("max_ping_workers", DEFAULT_MAX_WORKERS))
 
     def create_monitor_widgets(self, parent):
         toolbar = ttk.Frame(parent)
@@ -604,6 +688,10 @@ class PingApp(tk.Tk):
         )
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+
+        ttk.Button(toolbar, text="Настройки", command=self.open_settings_dialog).pack(
+            side=tk.LEFT, padx=2
+        )
 
         ttk.Label(toolbar, text="Поиск:").pack(side=tk.LEFT, padx=5)
         self.search_var = tk.StringVar()
@@ -647,8 +735,8 @@ class PingApp(tk.Tk):
         self.tree.heading("address", text="Адрес")
         self.tree.heading("description", text="Описание")
         self.tree.heading("subgroup", text="Подгруппа")
-        self.tree.heading("ping_interval", text="Интервал (мин)")
-        self.tree.heading("latency", text="Задержка (сек)")
+        self.tree.heading("ping_interval", text="Интервал (сек)")
+        self.tree.heading("latency", text="Задержка (мс)")
         self.tree.heading("last_check", text="Последняя проверка")
 
         self.tree.column("status_indicator", width=30)
@@ -687,6 +775,12 @@ class PingApp(tk.Tk):
             "status": tk.StringVar(value="—"),
             "latency": tk.StringVar(value="—"),
             "last_check": tk.StringVar(value="—"),
+            "status_change": tk.StringVar(value="—"),
+            "min_latency": tk.StringVar(value="—"),
+            "max_latency": tk.StringVar(value="—"),
+            "avg_latency": tk.StringVar(value="—"),
+            "jitter": tk.StringVar(value="—"),
+            "loss": tk.StringVar(value="—"),
         }
 
         for label, key in [
@@ -697,6 +791,7 @@ class PingApp(tk.Tk):
             ("Статус:", "status"),
             ("Задержка:", "latency"),
             ("Последняя проверка:", "last_check"),
+            ("Последняя смена:", "status_change"),
         ]:
             row = ttk.Frame(info_frame)
             row.pack(fill=tk.X, pady=2)
@@ -705,11 +800,44 @@ class PingApp(tk.Tk):
                 side=tk.LEFT, fill=tk.X, expand=True
             )
 
+        metrics_frame = tk.Frame(detail_frame, bg="#0f172a", padx=8, pady=8)
+        metrics_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
+
+        metric_items = [
+            ("Мин", "min_latency"),
+            ("Макс", "max_latency"),
+            ("Средняя", "avg_latency"),
+            ("Джиттер", "jitter"),
+            ("Потери", "loss"),
+        ]
+        for idx, (label, key) in enumerate(metric_items):
+            card = tk.Frame(metrics_frame, bg="#111827", padx=8, pady=6)
+            card.grid(row=idx // 2, column=idx % 2, padx=6, pady=6, sticky="nsew")
+            metrics_frame.grid_columnconfigure(idx % 2, weight=1)
+            tk.Label(
+                card,
+                text=label,
+                bg="#111827",
+                fg="#9ca3af",
+                font=("Segoe UI", 9),
+            ).pack(anchor="w")
+            tk.Label(
+                card,
+                textvariable=self.detail_vars[key],
+                bg="#111827",
+                fg="#f9fafb",
+                font=("Segoe UI", 11, "bold"),
+            ).pack(anchor="w")
+
         ttk.Label(detail_frame, text="График задержек", font=("Segoe UI", 11, "bold")).pack(
             anchor="w", padx=10, pady=(16, 6)
         )
         self.chart_canvas = tk.Canvas(
-            detail_frame, height=200, background="#ffffff", highlightthickness=1
+            detail_frame,
+            height=220,
+            background="#0b0f15",
+            highlightthickness=1,
+            highlightbackground="#1f2937",
         )
         self.chart_canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
         self.chart_canvas.bind("<Configure>", lambda event: self.update_chart())
@@ -843,17 +971,16 @@ class PingApp(tk.Tk):
         sub_entry = ttk.Entry(dialog, width=30)
         sub_entry.pack(pady=5)
 
-        ttk.Label(dialog, text="Интервал пинга (минуты, стандарт 10):").pack(pady=5)
-        interval_var = tk.StringVar(value="10")
+        ttk.Label(dialog, text="Интервал пинга (секунды):").pack(pady=5)
+        interval_var = tk.StringVar(value=str(self.default_interval_seconds))
         interval_entry = ttk.Entry(dialog, width=30, textvariable=interval_var)
         interval_entry.pack(pady=5)
 
         def save():
             try:
-                interval_minutes = int(interval_var.get())
-                if interval_minutes <= 0:
-                    raise ValueError("Интервал должен быть больше 0 минут.")
-                interval_seconds = interval_minutes * 60
+                interval_seconds = int(interval_var.get())
+                if interval_seconds <= 0:
+                    raise ValueError("Интервал должен быть больше 0 секунд.")
                 self.db.add_host(
                     self.current_group,
                     addr_entry.get(),
@@ -908,18 +1035,17 @@ class PingApp(tk.Tk):
         sub_entry.insert(0, host_data[2] or "")
         sub_entry.pack(pady=5)
 
-        ttk.Label(dialog, text="Интервал пинга (минуты):").pack(pady=5)
-        interval_minutes = host_data[3] // 60 if host_data[3] else 10
-        interval_var = tk.StringVar(value=str(interval_minutes))
+        ttk.Label(dialog, text="Интервал пинга (секунды):").pack(pady=5)
+        interval_seconds = host_data[3] if host_data[3] else self.default_interval_seconds
+        interval_var = tk.StringVar(value=str(interval_seconds))
         interval_entry = ttk.Entry(dialog, width=30, textvariable=interval_var)
         interval_entry.pack(pady=5)
 
         def save():
             try:
-                interval_minutes = int(interval_var.get())
-                if interval_minutes <= 0:
-                    raise ValueError("Интервал должен быть больше 0 минут.")
-                interval_seconds = interval_minutes * 60
+                interval_seconds = int(interval_var.get())
+                if interval_seconds <= 0:
+                    raise ValueError("Интервал должен быть больше 0 секунд.")
                 self.db.update_host(
                     self.current_group,
                     host_data[0],
@@ -966,11 +1092,11 @@ class PingApp(tk.Tk):
                 ws = wb.active
                 ws.title = "hosts"
 
-                ws.append(["address", "description", "subgroup", "ping_interval_min"])
+                ws.append(["address", "description", "subgroup", "ping_interval_sec"])
                 hosts = self.db.get_hosts(self.current_group)
                 for h in hosts:
-                    interval_min = h[3] // 60 if h[3] else 10
-                    ws.append([h[0], h[1], h[2] or "", interval_min])
+                    interval_sec = h[3] if h[3] else self.default_interval_seconds
+                    ws.append([h[0], h[1], h[2] or "", interval_sec])
 
                 for col in ws.columns:
                     max_length = 0
@@ -1006,13 +1132,17 @@ class PingApp(tk.Tk):
                 if not rows:
                     return
 
+                headers = [str(cell).strip().lower() if cell else "" for cell in rows[0]]
+                interval_is_minutes = "ping_interval_min" in headers
                 for row in rows[1:]:
                     if row and len(row) >= 2:
                         addr = row[0]
                         desc = row[1]
                         sub = row[2] if len(row) > 2 else None
-                        interval_min = int(row[3]) if len(row) > 3 and row[3] else 10
-                        interval_sec = interval_min * 60
+                        interval_value = (
+                            int(row[3]) if len(row) > 3 and row[3] else self.default_interval_seconds
+                        )
+                        interval_sec = interval_value * 60 if interval_is_minutes else interval_value
                         if addr:
                             self.db.add_host(self.current_group, addr, desc, sub, interval_sec)
 
@@ -1020,6 +1150,55 @@ class PingApp(tk.Tk):
                 messagebox.showinfo("Успех", "Данные импортированы из Excel.")
             except Exception as e:
                 messagebox.showerror("Ошибка", str(e))
+
+    def open_settings_dialog(self):
+        dialog = tk.Toplevel(self)
+        dialog.title("Настройки")
+        dialog.geometry("360x320")
+
+        fields = [
+            ("Интервал по умолчанию (сек)", "default_interval_seconds", self.default_interval_seconds),
+            ("Интервал цикла мониторинга (сек)", "monitor_interval_seconds", self.monitor_interval),
+            ("Таймаут пинга (сек)", "ping_timeout_seconds", self.ping_timeout),
+            ("Размер пачки пингов", "ping_batch_size", self.batch_size),
+            ("Макс. потоков пинга", "max_ping_workers", self.max_workers),
+        ]
+
+        entries = {}
+        for label, key, value in fields:
+            row = ttk.Frame(dialog)
+            row.pack(fill=tk.X, padx=10, pady=6)
+            ttk.Label(row, text=label).pack(side=tk.LEFT)
+            entry = ttk.Entry(row, width=10)
+            entry.insert(0, str(value))
+            entry.pack(side=tk.RIGHT)
+            entries[key] = entry
+
+        def save():
+            try:
+                default_interval = int(entries["default_interval_seconds"].get())
+                monitor_interval = float(entries["monitor_interval_seconds"].get())
+                ping_timeout = float(entries["ping_timeout_seconds"].get())
+                batch_size = int(entries["ping_batch_size"].get())
+                max_workers = int(entries["max_ping_workers"].get())
+
+                if default_interval <= 0 or monitor_interval <= 0 or ping_timeout <= 0:
+                    raise ValueError("Интервалы и таймаут должны быть больше 0.")
+                if batch_size <= 0 or max_workers <= 0:
+                    raise ValueError("Размеры должны быть больше 0.")
+
+                self.db.set_setting("default_interval_seconds", default_interval)
+                self.db.set_setting("monitor_interval_seconds", monitor_interval)
+                self.db.set_setting("ping_timeout_seconds", ping_timeout)
+                self.db.set_setting("ping_batch_size", batch_size)
+                self.db.set_setting("max_ping_workers", max_workers)
+
+                self.load_settings()
+                dialog.destroy()
+            except ValueError as e:
+                messagebox.showerror("Ошибка", str(e))
+
+        ttk.Button(dialog, text="Сохранить", command=save).pack(pady=10)
 
     def get_status_color(self, address):
         if address not in self.host_status_cache:
@@ -1064,16 +1243,26 @@ class PingApp(tk.Tk):
 
             self.host_status_cache[address] = (status, offline_since)
 
-            interval_min = interval_sec // 60 if interval_sec else 10
+            interval_value = interval_sec if interval_sec else self.default_interval_seconds
             color_name = self.get_status_color(address)
             tag = f"status_{color_name}"
-
+            recent = self.db.get_recent_results(self.current_group, address, limit=1)
+            last_latency = recent[-1][2] if recent else None
+            latency_ms = f"{last_latency * 1000:.0f}" if last_latency else "-"
             last_check_display = last_ping_time or "-"
 
             self.tree.insert(
                 "",
                 "end",
-                values=("●", address, desc, subgroup or "", interval_min, "-", last_check_display),
+                values=(
+                    "●",
+                    address,
+                    desc,
+                    subgroup or "",
+                    interval_value,
+                    latency_ms,
+                    last_check_display,
+                ),
                 tags=(tag,),
             )
 
@@ -1107,17 +1296,55 @@ class PingApp(tk.Tk):
 
         address, desc, subgroup, interval_sec, last_ping_time, _ = host_data
         status = self.db.get_last_status(self.current_group, address)
-        latest_results = self.db.get_recent_results(self.current_group, address, limit=1)
-        latest_latency = latest_results[-1][2] if latest_results else None
+        recent_results = self.db.get_recent_results(self.current_group, address, limit=50)
+        latest_latency = recent_results[-1][2] if recent_results else None
+        last_status, last_change_time = self.db.get_last_status_change(
+            self.current_group, address
+        )
+
+        latencies = [row[2] for row in recent_results if row[2] is not None]
+        loss_count = sum(1 for row in recent_results if row[1] == "Offline")
+        total_count = len(recent_results)
+        jitter = None
+        if len(latencies) > 1:
+            diffs = [abs(latencies[i] - latencies[i - 1]) for i in range(1, len(latencies))]
+            jitter = sum(diffs) / len(diffs)
 
         self.detail_vars["address"].set(address)
         self.detail_vars["description"].set(desc or "—")
         self.detail_vars["subgroup"].set(subgroup or "—")
-        interval_min = interval_sec // 60 if interval_sec else 10
-        self.detail_vars["interval"].set(f"{interval_min} мин")
+        interval_value = interval_sec if interval_sec else self.default_interval_seconds
+        self.detail_vars["interval"].set(f"{interval_value} сек")
         self.detail_vars["status"].set(status)
-        self.detail_vars["latency"].set(f"{latest_latency:.3f} сек" if latest_latency else "—")
+        self.detail_vars["latency"].set(
+            f"{latest_latency * 1000:.0f} мс" if latest_latency else "—"
+        )
         self.detail_vars["last_check"].set(last_ping_time or "—")
+        if last_status and last_change_time:
+            self.detail_vars["status_change"].set(
+                f"{last_status} в {last_change_time}"
+            )
+        else:
+            self.detail_vars["status_change"].set("—")
+
+        if latencies:
+            self.detail_vars["min_latency"].set(f"{min(latencies) * 1000:.0f} мс")
+            self.detail_vars["max_latency"].set(f"{max(latencies) * 1000:.0f} мс")
+            self.detail_vars["avg_latency"].set(
+                f"{(sum(latencies) / len(latencies)) * 1000:.0f} мс"
+            )
+        else:
+            self.detail_vars["min_latency"].set("—")
+            self.detail_vars["max_latency"].set("—")
+            self.detail_vars["avg_latency"].set("—")
+
+        self.detail_vars["jitter"].set(
+            f"{jitter * 1000:.0f} мс" if jitter is not None else "—"
+        )
+        if total_count > 0:
+            self.detail_vars["loss"].set(f"{(loss_count / total_count) * 100:.1f}%")
+        else:
+            self.detail_vars["loss"].set("—")
 
     def update_chart(self):
         self.chart_canvas.delete("all")
@@ -1128,30 +1355,100 @@ class PingApp(tk.Tk):
         if not data:
             return
 
-        latencies = [row[2] for row in data if row[2] is not None]
-        if not latencies:
-            return
-
+        latencies_ms = [row[2] * 1000 for row in data if row[2] is not None]
         width = self.chart_canvas.winfo_width() or 300
-        height = self.chart_canvas.winfo_height() or 200
-        padding = 20
-        min_latency = min(latencies)
-        max_latency = max(latencies)
-        span = max(max_latency - min_latency, 0.001)
+        height = self.chart_canvas.winfo_height() or 220
+        padding = 28
+
+        if latencies_ms:
+            min_latency = min(latencies_ms)
+            max_latency = max(latencies_ms)
+        else:
+            min_latency = 0
+            max_latency = 1
+
+        span = max(max_latency - min_latency, 1)
+
+        self.chart_canvas.create_rectangle(
+            0, 0, width, height, fill="#0b0f15", outline=""
+        )
+
+        for i in range(5):
+            y = padding + i * (height - 2 * padding) / 4
+            self.chart_canvas.create_line(
+                padding, y, width - padding, y, fill="#1f2937"
+            )
+
+        for i in range(5):
+            x = padding + i * (width - 2 * padding) / 4
+            self.chart_canvas.create_line(
+                x, padding, x, height - padding, fill="#1f2937"
+            )
 
         points = []
-        for idx, latency in enumerate(latencies):
-            x = padding + idx * (width - 2 * padding) / max(len(latencies) - 1, 1)
-            y = height - padding - (latency - min_latency) / span * (height - 2 * padding)
-            points.extend([x, y])
+        for idx, (timestamp, status, latency) in enumerate(data):
+            x = padding + idx * (width - 2 * padding) / max(len(data) - 1, 1)
+            if latency is None:
+                y = height - padding
+                self.chart_canvas.create_line(
+                    x - 4, y - 4, x + 4, y + 4, fill="#ef4444", width=2
+                )
+                self.chart_canvas.create_line(
+                    x - 4, y + 4, x + 4, y - 4, fill="#ef4444", width=2
+                )
+                points.append(None)
+                continue
 
-        self.chart_canvas.create_line(
-            padding, height - padding, width - padding, height - padding, fill="#e5e7eb"
+            latency_ms = latency * 1000
+            y = height - padding - (latency_ms - min_latency) / span * (
+                height - 2 * padding
+            )
+            points.append((x, y))
+            self.chart_canvas.create_oval(
+                x - 2, y - 2, x + 2, y + 2, fill="#f9fafb", outline=""
+            )
+
+            if idx in (0, len(data) - 1) or idx % max(len(data) // 4, 1) == 0:
+                time_label = timestamp.split(" ")[-1]
+                self.chart_canvas.create_text(
+                    x,
+                    height - padding + 12,
+                    text=time_label,
+                    fill="#9ca3af",
+                    font=("Segoe UI", 7),
+                )
+
+        segment = []
+        for point in points:
+            if point is None:
+                if len(segment) > 1:
+                    self.chart_canvas.create_line(
+                        segment, fill="#60a5fa", width=2, smooth=True
+                    )
+                segment = []
+            else:
+                segment.extend(point)
+        if len(segment) > 1:
+            self.chart_canvas.create_line(
+                segment, fill="#60a5fa", width=2, smooth=True
+            )
+
+        self.chart_canvas.create_text(
+            padding,
+            padding - 10,
+            text=f"{max_latency:.0f} мс",
+            fill="#9ca3af",
+            anchor="w",
+            font=("Segoe UI", 8),
         )
-        self.chart_canvas.create_line(
-            padding, padding, padding, height - padding, fill="#e5e7eb"
+        self.chart_canvas.create_text(
+            padding,
+            height - padding + 2,
+            text=f"{min_latency:.0f} мс",
+            fill="#9ca3af",
+            anchor="w",
+            font=("Segoe UI", 8),
         )
-        self.chart_canvas.create_line(points, fill="#2563eb", width=2, smooth=True)
 
     def toggle_monitoring(self):
         if self.monitoring:
@@ -1181,9 +1478,10 @@ class PingApp(tk.Tk):
     def ping_hosts_batch(self, hosts_batch):
         entries = []
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PING_WORKERS) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_host = {
-                executor.submit(ping_host_subprocess, host[1]): host for host in hosts_batch
+                executor.submit(ping_host_subprocess, host[1], self.ping_timeout): host
+                for host in hosts_batch
             }
             for future in concurrent.futures.as_completed(future_to_host):
                 host = future_to_host[future]
@@ -1232,7 +1530,7 @@ class PingApp(tk.Tk):
                         due_hosts.append((group, address, subgroup))
 
             if due_hosts:
-                for batch in self.chunk_hosts(due_hosts, PING_BATCH_SIZE):
+                for batch in self.chunk_hosts(due_hosts, self.batch_size):
                     if not self.monitoring:
                         break
                     results = self.ping_hosts_batch(batch)
@@ -1273,7 +1571,7 @@ class PingApp(tk.Tk):
                 tag = f"status_{color}"
 
                 indicator = "●"
-                latency_str = f"{latency:.3f}" if latency else "-"
+                latency_str = f"{latency * 1000:.0f}" if latency else "-"
                 new_vals = (
                     indicator,
                     vals[1],
