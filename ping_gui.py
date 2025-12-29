@@ -1,24 +1,17 @@
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, simpledialog
 import sqlite3
 import subprocess
 import platform
 import threading
 import time
 import re
-import csv
-from datetime import datetime, timedelta
-import sys
-import os
+import queue
+import concurrent.futures
+from datetime import datetime
 
-# Try to import multiping
-try:
-    from multiping import multi_ping
-    HAS_MULTIPING = True
-except ImportError:
-    HAS_MULTIPING = False
+from PySide6 import QtCore, QtWidgets
+from PySide6.QtCharts import QChart, QChartView, QLineSeries, QScatterSeries, QValueAxis
+from PySide6.QtGui import QPainter
 
-# Import openpyxl for Excel support
 try:
     from openpyxl import Workbook, load_workbook
     from openpyxl.utils import get_column_letter
@@ -26,10 +19,15 @@ try:
 except ImportError:
     HAS_OPENPYXL = False
 
-# --- VALIDATION UTILS ---
+DEFAULT_PING_INTERVAL = 600
+DEFAULT_MONITOR_INTERVAL = 1
+DEFAULT_PING_TIMEOUT = 1
+DEFAULT_BATCH_SIZE = 50
+DEFAULT_MAX_WORKERS = 20
+STATS_REFRESH_INTERVAL = 5
+
 
 def clean_address(address):
-    """Очистка и проверка адреса хоста."""
     address = address.strip()
     if not address:
         raise ValueError("Адрес не может быть пустым.")
@@ -38,13 +36,19 @@ def clean_address(address):
     ipv6_pattern = r"^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$"
     domain_pattern = r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$"
 
-    if not (re.match(ipv4_pattern, address) or re.match(ipv6_pattern, address) or re.match(domain_pattern, address)):
-        raise ValueError(f"Некорректный адрес: {address}. Должен быть IPv4, IPv6 или доменным именем.")
-    
+    if not (
+        re.match(ipv4_pattern, address)
+        or re.match(ipv6_pattern, address)
+        or re.match(domain_pattern, address)
+    ):
+        raise ValueError(
+            f"Некорректный адрес: {address}. Должен быть IPv4, IPv6 или доменным именем."
+        )
+
     return address
 
+
 def clean_group_name(group_name):
-    """Очистка имени группы или подгруппы."""
     group_name = group_name.strip()
     if not group_name:
         raise ValueError("Имя группы не может быть пустым.")
@@ -52,781 +56,1502 @@ def clean_group_name(group_name):
         raise ValueError("Некорректное имя группы. Используйте буквы, цифры и пробелы.")
     return group_name
 
-# --- DATABASE MANAGER ---
 
 class DatabaseManager:
     def __init__(self, db_name="monitoring_gui.db"):
         self.conn = sqlite3.connect(db_name, check_same_thread=False)
         self.cursor = self.conn.cursor()
+        self.lock = threading.RLock()
         self.init_db()
+        self.migrate_legacy_tables()
 
     def init_db(self):
-        self.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS groups (
-                group_name TEXT PRIMARY KEY
+        with self.lock:
+            self.cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS groups (
+                    group_name TEXT PRIMARY KEY,
+                    active INTEGER DEFAULT 0
+                )
+            """
             )
-        """)
-        self.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS ping_results (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                group_name TEXT,
-                subgroup TEXT,
-                address TEXT,
-                status TEXT,
-                latency REAL
+            self.cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS hosts (
+                    group_name TEXT NOT NULL,
+                    address TEXT NOT NULL,
+                    description TEXT,
+                    subgroup TEXT,
+                    ping_interval INTEGER DEFAULT 600,
+                    last_ping_time TEXT,
+                    offline_since TEXT,
+                    PRIMARY KEY (group_name, address)
+                )
+            """
             )
-        """)
-        self.conn.commit()
+            self.cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ping_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT,
+                    group_name TEXT,
+                    subgroup TEXT,
+                    address TEXT,
+                    status TEXT,
+                    latency REAL
+                )
+            """
+            )
+            self.cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_hosts_group
+                ON hosts (group_name)
+            """
+            )
+            self.cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_ping_results_group_address
+                ON ping_results (group_name, address)
+            """
+            )
+            self.cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """
+            )
+            self.cursor.executemany(
+                """
+                INSERT OR IGNORE INTO settings (key, value)
+                VALUES (?, ?)
+            """,
+                [
+                    ("default_interval_seconds", str(DEFAULT_PING_INTERVAL)),
+                    ("monitor_interval_seconds", str(DEFAULT_MONITOR_INTERVAL)),
+                    ("ping_timeout_seconds", str(DEFAULT_PING_TIMEOUT)),
+                    ("ping_batch_size", str(DEFAULT_BATCH_SIZE)),
+                    ("max_ping_workers", str(DEFAULT_MAX_WORKERS)),
+                ],
+            )
+            self.conn.commit()
+            self.ensure_groups_schema()
+
+    def ensure_groups_schema(self):
+        self.cursor.execute("PRAGMA table_info(groups)")
+        columns = [row[1] for row in self.cursor.fetchall()]
+        if "active" not in columns:
+            self.cursor.execute("ALTER TABLE groups ADD COLUMN active INTEGER DEFAULT 0")
+            self.conn.commit()
+
+    def migrate_legacy_tables(self):
+        with self.lock:
+            self.cursor.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type='table' AND name LIKE 'hosts_%'
+            """
+            )
+            legacy_tables = [row[0] for row in self.cursor.fetchall()]
+            for table_name in legacy_tables:
+                group_name = table_name[len("hosts_") :]
+                if not group_name:
+                    continue
+                self.cursor.execute(
+                    "INSERT OR IGNORE INTO groups (group_name, active) VALUES (?, 0)",
+                    (group_name,),
+                )
+                self.cursor.execute(
+                    f"SELECT address, description, subgroup, ping_interval, last_ping_time, offline_since FROM {table_name}"
+                )
+                rows = self.cursor.fetchall()
+                if rows:
+                    self.cursor.executemany(
+                        """
+                        INSERT OR REPLACE INTO hosts
+                        (group_name, address, description, subgroup, ping_interval, last_ping_time, offline_since)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                        [
+                            (
+                                group_name,
+                                row[0],
+                                row[1],
+                                row[2],
+                                row[3],
+                                row[4],
+                                row[5],
+                            )
+                            for row in rows
+                        ],
+                    )
+                self.cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+            self.conn.commit()
 
     def create_group(self, group_name):
         group_name = clean_group_name(group_name)
-        self.cursor.execute(f"""
-            CREATE TABLE IF NOT EXISTS hosts_{group_name} (
-                address TEXT PRIMARY KEY,
-                description TEXT,
-                subgroup TEXT,
-                ping_interval INTEGER DEFAULT 600,
-                last_ping_time TEXT,
-                offline_since TEXT
+        with self.lock:
+            self.cursor.execute(
+                "INSERT OR IGNORE INTO groups (group_name, active) VALUES (?, 0)",
+                (group_name,),
             )
-        """)
-        self.cursor.execute("INSERT OR IGNORE INTO groups (group_name) VALUES (?)", (group_name,))
-        self.conn.commit()
+            self.conn.commit()
         return group_name
 
     def delete_group(self, group_name):
         group_name = clean_group_name(group_name)
-        self.cursor.execute(f"DROP TABLE IF EXISTS hosts_{group_name}")
-        self.cursor.execute("DELETE FROM groups WHERE group_name = ?", (group_name,))
-        self.cursor.execute("DELETE FROM ping_results WHERE group_name = ?", (group_name,))
-        self.conn.commit()
+        with self.lock:
+            self.cursor.execute("DELETE FROM groups WHERE group_name = ?", (group_name,))
+            self.cursor.execute("DELETE FROM hosts WHERE group_name = ?", (group_name,))
+            self.cursor.execute(
+                "DELETE FROM ping_results WHERE group_name = ?", (group_name,)
+            )
+            self.conn.commit()
 
     def get_groups(self):
-        self.cursor.execute("SELECT group_name FROM groups")
-        return [row[0] for row in self.cursor.fetchall()]
+        with self.lock:
+            self.cursor.execute("SELECT group_name FROM groups")
+            return [row[0] for row in self.cursor.fetchall()]
 
-    def add_host(self, group_name, address, description, subgroup=None, ping_interval=600):
+    def get_groups_with_status(self):
+        with self.lock:
+            self.cursor.execute("SELECT group_name, active FROM groups")
+            return {row[0]: bool(row[1]) for row in self.cursor.fetchall()}
+
+    def set_group_active(self, group_name, active):
+        group_name = clean_group_name(group_name)
+        with self.lock:
+            self.cursor.execute(
+                "UPDATE groups SET active = ? WHERE group_name = ?",
+                (1 if active else 0, group_name),
+            )
+            self.conn.commit()
+
+    def get_active_groups(self):
+        with self.lock:
+            self.cursor.execute("SELECT group_name FROM groups WHERE active = 1")
+            return [row[0] for row in self.cursor.fetchall()]
+
+    def get_setting(self, key, default=None):
+        with self.lock:
+            self.cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+            row = self.cursor.fetchone()
+            return row[0] if row else default
+
+    def set_setting(self, key, value):
+        with self.lock:
+            self.cursor.execute(
+                """
+                INSERT INTO settings (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+                (key, str(value)),
+            )
+            self.conn.commit()
+
+    def add_host(self, group_name, address, description, subgroup=None, ping_interval=DEFAULT_PING_INTERVAL):
         group_name = clean_group_name(group_name)
         address = clean_address(address)
         if subgroup:
             subgroup = clean_group_name(subgroup)
-        self.cursor.execute(f"""
-            INSERT OR REPLACE INTO hosts_{group_name} 
-            (address, description, subgroup, ping_interval, last_ping_time, offline_since) 
-            VALUES (?, ?, ?, ?, NULL, NULL)
-        """, (address, description, subgroup, ping_interval))
-        self.conn.commit()
+        with self.lock:
+            self.cursor.execute(
+                """
+                INSERT OR REPLACE INTO hosts
+                (group_name, address, description, subgroup, ping_interval, last_ping_time, offline_since)
+                VALUES (?, ?, ?, ?, ?, NULL, NULL)
+            """,
+                (group_name, address, description, subgroup, ping_interval),
+            )
+            self.conn.commit()
+
+    def update_host(self, group_name, address, description, subgroup=None, ping_interval=DEFAULT_PING_INTERVAL):
+        group_name = clean_group_name(group_name)
+        address = clean_address(address)
+        if subgroup:
+            subgroup = clean_group_name(subgroup)
+        with self.lock:
+            self.cursor.execute(
+                """
+                UPDATE hosts
+                SET description = ?, subgroup = ?, ping_interval = ?
+                WHERE group_name = ? AND address = ?
+            """,
+                (description, subgroup, ping_interval, group_name, address),
+            )
+            self.conn.commit()
 
     def remove_host(self, group_name, address):
         group_name = clean_group_name(group_name)
         address = clean_address(address)
-        self.cursor.execute(f"DELETE FROM hosts_{group_name} WHERE address = ?", (address,))
-        self.conn.commit()
+        with self.lock:
+            self.cursor.execute(
+                "DELETE FROM hosts WHERE group_name = ? AND address = ?",
+                (group_name, address),
+            )
+            self.conn.commit()
 
     def get_hosts(self, group_name):
-        try:
-            group_name = clean_group_name(group_name)
-            self.cursor.execute(f"""
-                SELECT address, description, subgroup, ping_interval, last_ping_time, offline_since 
-                FROM hosts_{group_name}
-            """)
+        group_name = clean_group_name(group_name)
+        with self.lock:
+            self.cursor.execute(
+                """
+                SELECT address, description, subgroup, ping_interval, last_ping_time, offline_since
+                FROM hosts
+                WHERE group_name = ?
+            """,
+                (group_name,),
+            )
             return self.cursor.fetchall()
-        except sqlite3.OperationalError:
-            return []
 
-    def update_ping_time(self, group_name, address, status):
-        """Обновить last_ping_time и offline_since"""
+    def get_last_status(self, group_name, address):
+        group_name = clean_group_name(group_name)
+        address = clean_address(address)
+        with self.lock:
+            self.cursor.execute(
+                """
+                SELECT status FROM ping_results
+                WHERE group_name = ? AND address = ?
+                ORDER BY id DESC LIMIT 1
+            """,
+                (group_name, address),
+            )
+            row = self.cursor.fetchone()
+            return row[0] if row else "Unknown"
+
+    def get_recent_results(self, group_name, address, limit=50):
+        group_name = clean_group_name(group_name)
+        address = clean_address(address)
+        with self.lock:
+            self.cursor.execute(
+                """
+                SELECT timestamp, status, latency
+                FROM ping_results
+                WHERE group_name = ? AND address = ?
+                ORDER BY id DESC
+                LIMIT ?
+            """,
+                (group_name, address, limit),
+            )
+            return list(reversed(self.cursor.fetchall()))
+
+    def get_last_status_change(self, group_name, address, limit=200):
+        group_name = clean_group_name(group_name)
+        address = clean_address(address)
+        with self.lock:
+            self.cursor.execute(
+                """
+                SELECT timestamp, status
+                FROM ping_results
+                WHERE group_name = ? AND address = ?
+                ORDER BY id DESC
+                LIMIT ?
+            """,
+                (group_name, address, limit),
+            )
+            rows = self.cursor.fetchall()
+        if not rows:
+            return None, None
+        last_status = rows[0][1]
+        last_change_time = rows[0][0]
+        for timestamp, status in rows[1:]:
+            if status != last_status:
+                break
+            last_change_time = timestamp
+        return last_status, last_change_time
+
+    def update_ping_time(self, group_name, address, status, commit=True):
         group_name = clean_group_name(group_name)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        if status == "Online":
-            self.cursor.execute(f"""
-                UPDATE hosts_{group_name} 
-                SET last_ping_time = ?, offline_since = NULL 
-                WHERE address = ?
-            """, (now, address))
-        else:  # Offline
-            # Если уже offline, не менять offline_since. Если был online, установить сейчас
-            self.cursor.execute(f"""
-                SELECT offline_since FROM hosts_{group_name} WHERE address = ?
-            """, (address,))
-            row = self.cursor.fetchone()
-            if row and row[0] is None:
-                # Был online, переходит offline
-                self.cursor.execute(f"""
-                    UPDATE hosts_{group_name} 
-                    SET last_ping_time = ?, offline_since = ? 
-                    WHERE address = ?
-                """, (now, now, address))
+        with self.lock:
+            if status == "Online":
+                self.cursor.execute(
+                    """
+                    UPDATE hosts
+                    SET last_ping_time = ?, offline_since = NULL
+                    WHERE group_name = ? AND address = ?
+                """,
+                    (now, group_name, address),
+                )
             else:
-                # Уже offline
-                self.cursor.execute(f"""
-                    UPDATE hosts_{group_name} 
-                    SET last_ping_time = ? 
-                    WHERE address = ?
-                """, (now, address))
-        self.conn.commit()
-            
-    def get_all_hosts_stats(self):
-        """Возвращает статистику по всем группам с их статусами."""
-        groups = self.get_groups()
-        stats = []
-        
-        for group in groups:
-            hosts = self.get_hosts(group)
-            total = len(hosts)
-            
-            online_count = 0
-            offline_count = 0
-            critical_offline = False  # есть offline >= 1 часа
-            warning_offline = False   # есть offline < 1 часа
-            
-            for host in hosts:
-                address = host[0]
-                offline_since = host[5]  # последний элемент в кортеже хоста
-                
-                self.cursor.execute("""
-                    SELECT status FROM ping_results 
-                    WHERE group_name = ? AND address = ? 
-                    ORDER BY id DESC LIMIT 1
-                """, (group, address))
+                self.cursor.execute(
+                    """
+                    SELECT offline_since FROM hosts
+                    WHERE group_name = ? AND address = ?
+                """,
+                    (group_name, address),
+                )
                 row = self.cursor.fetchone()
-                if row:
-                    if row[0] == "Online":
-                        online_count += 1
-                    elif row[0] == "Offline":
-                        offline_count += 1
-                        # Проверить, критично ли offline
-                        if offline_since:
-                            try:
-                                offline_time = datetime.strptime(offline_since, "%Y-%m-%d %H:%M:%S")
-                                now = datetime.now()
-                                diff = (now - offline_time).total_seconds()
-                                if diff >= 3600:  # >= 1 часа
-                                    critical_offline = True
-                                else:
-                                    warning_offline = True
-                            except:
-                                critical_offline = True
-                        else:
-                            warning_offline = True
-            
-            # Определить статус группы
-            if critical_offline:
-                group_status = "critical"  # красный
-            elif warning_offline or (offline_count > 0 and online_count > 0):
-                group_status = "warning"   # жёлтый
-            elif online_count == total or (total == 0):
-                group_status = "healthy"   # зелёный
+                if row and row[0] is None:
+                    self.cursor.execute(
+                        """
+                        UPDATE hosts
+                        SET last_ping_time = ?, offline_since = ?
+                        WHERE group_name = ? AND address = ?
+                    """,
+                        (now, now, group_name, address),
+                    )
+                else:
+                    self.cursor.execute(
+                        """
+                        UPDATE hosts
+                        SET last_ping_time = ?
+                        WHERE group_name = ? AND address = ?
+                    """,
+                        (now, group_name, address),
+                    )
+            if commit:
+                self.conn.commit()
+
+    def log_results_batch(self, entries):
+        if not entries:
+            return
+        with self.lock:
+            self.cursor.executemany(
+                """
+                INSERT INTO ping_results
+                (timestamp, group_name, subgroup, address, status, latency)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """,
+                [
+                    (
+                        entry["timestamp"],
+                        entry["group_name"],
+                        entry["subgroup"],
+                        entry["address"],
+                        entry["status"],
+                        entry["latency"],
+                    )
+                    for entry in entries
+                ],
+            )
+            for entry in entries:
+                self.update_ping_time(
+                    entry["group_name"], entry["address"], entry["status"], commit=False
+                )
+            self.conn.commit()
+
+    def get_all_hosts_stats(self):
+        with self.lock:
+            self.cursor.execute(
+                """
+                SELECT h.group_name, h.address, h.offline_since, pr.status
+                FROM hosts h
+                LEFT JOIN (
+                    SELECT pr.group_name, pr.address, pr.status
+                    FROM ping_results pr
+                    INNER JOIN (
+                        SELECT group_name, address, MAX(id) AS max_id
+                        FROM ping_results
+                        GROUP BY group_name, address
+                    ) latest
+                    ON pr.id = latest.max_id
+                ) pr
+                ON pr.group_name = h.group_name AND pr.address = h.address
+            """
+            )
+            rows = self.cursor.fetchall()
+            self.cursor.execute("SELECT group_name FROM groups")
+            all_groups = [row[0] for row in self.cursor.fetchall()]
+
+        stats_by_group = {}
+        for group, address, offline_since, status in rows:
+            group_stats = stats_by_group.setdefault(
+                group,
+                {
+                    "group": group,
+                    "total": 0,
+                    "online": 0,
+                    "offline": 0,
+                    "unknown": 0,
+                    "status": "unknown",
+                },
+            )
+            group_stats["total"] += 1
+
+            if status == "Online":
+                group_stats["online"] += 1
+            elif status == "Offline":
+                group_stats["offline"] += 1
             else:
-                group_status = "unknown"
-            
-            stats.append({
-                "group": group,
-                "total": total,
-                "online": online_count,
-                "offline": offline_count,
-                "unknown": total - online_count - offline_count,
-                "status": group_status
-            })
-        return stats
-    
+                group_stats["unknown"] += 1
+
+            if status == "Offline":
+                if offline_since:
+                    try:
+                        offline_time = datetime.strptime(
+                            offline_since, "%Y-%m-%d %H:%M:%S"
+                        )
+                        if (datetime.now() - offline_time).total_seconds() >= 3600:
+                            group_stats["status"] = "critical"
+                        elif group_stats["status"] != "critical":
+                            group_stats["status"] = "warning"
+                    except ValueError:
+                        group_stats["status"] = "critical"
+                elif group_stats["status"] != "critical":
+                    group_stats["status"] = "warning"
+
+        for group_stats in stats_by_group.values():
+            if group_stats["status"] == "unknown":
+                if group_stats["offline"] > 0:
+                    group_stats["status"] = "warning"
+                elif group_stats["total"] == 0:
+                    group_stats["status"] = "healthy"
+                else:
+                    group_stats["status"] = "healthy"
+        for group in all_groups:
+            stats_by_group.setdefault(
+                group,
+                {
+                    "group": group,
+                    "total": 0,
+                    "online": 0,
+                    "offline": 0,
+                    "unknown": 0,
+                    "status": "healthy",
+                },
+            )
+        return list(stats_by_group.values())
+
     def get_overall_status(self):
-        """Получить общий статус всей системы."""
         stats = self.get_all_hosts_stats()
-        
         critical_count = sum(1 for s in stats if s["status"] == "critical")
         warning_count = sum(1 for s in stats if s["status"] == "warning")
-        
-        if critical_count > 0:
-            return "critical"  # красный
-        elif warning_count > 0:
-            return "warning"   # жёлтый
-        else:
-            return "healthy"   # зелёный
 
-    def log_result(self, group_name, subgroup, address, status, latency=None):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.cursor.execute(
-            "INSERT INTO ping_results (timestamp, group_name, subgroup, address, status, latency) VALUES (?, ?, ?, ?, ?, ?)",
-            (timestamp, group_name, subgroup, address, status, latency)
-        )
-        self.update_ping_time(group_name, address, status)
-        self.conn.commit()
+        if critical_count > 0:
+            return "critical"
+        if warning_count > 0:
+            return "warning"
+        return "healthy"
 
     def close(self):
-        self.conn.close()
+        with self.lock:
+            self.conn.close()
 
-# --- PING ENGINE ---
 
 def ping_host_subprocess(address, timeout=1.0):
-    """Fallback: Пингует хост, используя системную утилиту ping."""
-    param = '-n' if platform.system().lower() == 'windows' else '-c'
-    timeout_param = '-w' if platform.system().lower() == 'windows' else '-W'
-    
-    timeout_val = str(int(timeout * 1000)) if platform.system().lower() == 'windows' else str(int(timeout))
-    if platform.system().lower() != 'windows':
-         timeout_val = str(max(1, int(timeout)))
+    param = "-n" if platform.system().lower() == "windows" else "-c"
+    timeout_param = "-w" if platform.system().lower() == "windows" else "-W"
 
-    command = ['ping', param, '1', timeout_param, timeout_val, address]
+    timeout_val = str(int(timeout * 1000)) if platform.system().lower() == "windows" else str(
+        int(timeout)
+    )
+    if platform.system().lower() != "windows":
+        timeout_val = str(max(1, int(timeout)))
+
+    command = ["ping", param, "1", timeout_param, timeout_val, address]
 
     try:
         startupinfo = None
-        if platform.system().lower() == 'windows':
+        if platform.system().lower() == "windows":
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            
+
         start_time = time.time()
         result = subprocess.run(
-            command, 
-            stdout=subprocess.PIPE, 
+            command,
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             startupinfo=startupinfo,
-            text=True
+            text=True,
         )
         end_time = time.time()
-        
+
         duration = end_time - start_time
-        
+
         if result.returncode == 0:
             return True, duration
-        else:
-            return False, None
+        return False, None
     except Exception:
         return False, None
 
-# --- GUI APPLICATION ---
 
-class PingApp(tk.Tk):
+class PingApp(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.title("Ping Monitor")
-        self.geometry("1200x650")
-        
-        self.style = ttk.Style()
-        self.style.theme_use('clam')
-        self.configure(bg="#f0f0f0")
+        self.setWindowTitle("Ping Monitor")
+        self.resize(1200, 700)
 
         self.db = DatabaseManager()
         self.monitoring = False
         self.monitor_thread = None
-        self.monitor_interval = 2.0 
+        self.monitor_interval = DEFAULT_MONITOR_INTERVAL
+        self.ping_timeout = DEFAULT_PING_TIMEOUT
+        self.batch_size = DEFAULT_BATCH_SIZE
+        self.max_workers = DEFAULT_MAX_WORKERS
+        self.default_interval_seconds = DEFAULT_PING_INTERVAL
         self.current_group = None
-        self.host_status_cache = {}  # Кэш статусов для определения цвета индикатора
+        self.host_status_cache = {}
+        self.ui_queue = queue.Queue()
+        self.last_stats_refresh = 0
+        self.selected_host = None
+        self.settings_dialog = None
+        self.add_host_dialog = None
+        self.edit_host_dialog = None
+        self.create_group_dialog_ref = None
+        self.history_dialog = None
 
-        self.create_widgets()
+        self.load_settings()
+        self.build_ui()
         self.load_groups()
         self.update_overall_status()
-        
+
+        self.ui_timer = QtCore.QTimer(self)
+        self.ui_timer.timeout.connect(self.process_ui_queue)
+        self.ui_timer.start(200)
+
         if not HAS_OPENPYXL:
-            messagebox.showwarning("Внимание", "openpyxl не установлен. Экспорт/импорт могут не работать.")
-        if not HAS_MULTIPING:
-            messagebox.showinfo("Info", "Библиотека multiping не найдена. Используется системный ping (медленнее).")
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Внимание",
+                "openpyxl не установлен. Импорт/экспорт Excel будет недоступен.",
+            )
 
-    def create_widgets(self):
-        # Create Tabs
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # Tab 1: Monitor
-        self.tab_monitor = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_monitor, text="Мониторинг")
-        
-        # Tab 2: Statistics
-        self.tab_stats = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_stats, text="Статистика")
-        
-        # --- TAB 1 CONTENT ---
-        self.create_monitor_widgets(self.tab_monitor)
-        
-        # --- TAB 2 CONTENT ---
-        self.create_stats_widgets(self.tab_stats)
-        
-        # --- Overall Status Bar ---
-        overall_frame = ttk.Frame(self)
-        overall_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=3)
-        
-        ttk.Label(overall_frame, text="Общий статус:").pack(side=tk.LEFT, padx=5)
-        self.overall_status_label = ttk.Label(overall_frame, text="●", font=("Arial", 14))
-        self.overall_status_label.pack(side=tk.LEFT, padx=3)
-        
-        ttk.Separator(overall_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=5)
-        
-        # --- Status Bar (Shared) ---
-        self.status_var = tk.StringVar(value="Готов")
-        status_bar = ttk.Label(self, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
-        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+    def load_settings(self):
+        self.default_interval_seconds = int(
+            self.db.get_setting("default_interval_seconds", DEFAULT_PING_INTERVAL)
+        )
+        self.monitor_interval = float(
+            self.db.get_setting("monitor_interval_seconds", DEFAULT_MONITOR_INTERVAL)
+        )
+        self.ping_timeout = float(
+            self.db.get_setting("ping_timeout_seconds", DEFAULT_PING_TIMEOUT)
+        )
+        self.batch_size = int(self.db.get_setting("ping_batch_size", DEFAULT_BATCH_SIZE))
+        self.max_workers = int(self.db.get_setting("max_ping_workers", DEFAULT_MAX_WORKERS))
 
-    def create_monitor_widgets(self, parent):
-        # --- Toolbar ---
-        toolbar = ttk.Frame(parent)
-        toolbar.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+    def build_ui(self):
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        layout = QtWidgets.QVBoxLayout(central)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
 
-        ttk.Label(toolbar, text="Группа:").pack(side=tk.LEFT, padx=5)
-        self.group_combo = ttk.Combobox(toolbar, state="readonly", width=20)
-        self.group_combo.pack(side=tk.LEFT, padx=5)
-        self.group_combo.bind("<<ComboboxSelected>>", self.on_group_select)
+        self.tabs = QtWidgets.QTabWidget()
+        layout.addWidget(self.tabs)
 
-        ttk.Button(toolbar, text="Создать", command=self.create_group_dialog).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="Удалить", command=self.delete_group).pack(side=tk.LEFT, padx=2)
-        
-        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+        self.monitor_tab = QtWidgets.QWidget()
+        self.stats_tab = QtWidgets.QWidget()
+        self.tabs.addTab(self.monitor_tab, "Мониторинг")
+        self.tabs.addTab(self.stats_tab, "Статистика")
 
-        ttk.Button(toolbar, text="Добавить хост", command=self.add_host_dialog).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="Удалить хост", command=self.remove_host).pack(side=tk.LEFT, padx=2)
+        self.build_monitor_tab()
+        self.build_stats_tab()
 
-        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
-        
-        ttk.Button(toolbar, text="Экспорт (Excel)", command=self.export_data).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="Импорт (Excel)", command=self.import_data).pack(side=tk.LEFT, padx=2)
+        status_layout = QtWidgets.QHBoxLayout()
+        layout.addLayout(status_layout)
+        status_layout.addWidget(QtWidgets.QLabel("Общий статус:"))
+        self.overall_status_label = QtWidgets.QLabel("●")
+        status_layout.addWidget(self.overall_status_label)
+        status_layout.addStretch()
+        self.status_label = QtWidgets.QLabel("Готов")
+        status_layout.addWidget(self.status_label)
 
-        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+    def build_monitor_tab(self):
+        layout = QtWidgets.QVBoxLayout(self.monitor_tab)
+        layout.setSpacing(6)
 
-        self.btn_start = ttk.Button(toolbar, text="Старт", command=self.toggle_monitoring)
-        self.btn_start.pack(side=tk.LEFT, padx=5)
-        
-        # --- Treeview with custom columns ---
-        columns = ("status_indicator", "address", "description", "subgroup", "ping_interval", "latency", "last_check")
-        self.tree = ttk.Treeview(parent, columns=columns, show="headings", selectmode="extended", height=20)
-        
-        self.tree.heading("status_indicator", text="")
-        self.tree.heading("address", text="Адрес")
-        self.tree.heading("description", text="Описание")
-        self.tree.heading("subgroup", text="Подгруппа")
-        self.tree.heading("ping_interval", text="Интервал (мин)")
-        self.tree.heading("latency", text="Задержка (сек)")
-        self.tree.heading("last_check", text="Последняя проверка")
+        toolbar = QtWidgets.QHBoxLayout()
+        layout.addLayout(toolbar)
 
-        self.tree.column("status_indicator", width=30)
-        self.tree.column("address", width=140)
-        self.tree.column("description", width=180)
-        self.tree.column("subgroup", width=90)
-        self.tree.column("ping_interval", width=80)
-        self.tree.column("latency", width=80)
-        self.tree.column("last_check", width=130)
+        toolbar.addWidget(QtWidgets.QLabel("Группа:"))
+        self.group_combo = QtWidgets.QComboBox()
+        self.group_combo.currentTextChanged.connect(self.on_group_select)
+        toolbar.addWidget(self.group_combo)
 
-        scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
-        
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # Configure tags for status colors
-        self.tree.tag_configure("status_green", foreground="#2ecc71")
-        self.tree.tag_configure("status_yellow", foreground="#f39c12")
-        self.tree.tag_configure("status_red", foreground="#e74c3c")
-        self.tree.tag_configure("status_gray", foreground="#95a5a6")
+        toolbar.addWidget(self.create_button("Создать", self.show_create_group_dialog))
+        toolbar.addWidget(self.create_button("Удалить", self.delete_group))
+        toolbar.addSpacing(10)
 
-    def create_stats_widgets(self, parent):
-        toolbar = ttk.Frame(parent)
-        toolbar.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
-        
-        ttk.Button(toolbar, text="Обновить статистику", command=self.refresh_stats).pack(side=tk.LEFT, padx=5)
-        
-        columns = ("status", "group", "total", "online", "offline", "unknown")
-        self.stats_tree = ttk.Treeview(parent, columns=columns, show="headings", selectmode="browse")
-        
-        self.stats_tree.heading("status", text="")
-        self.stats_tree.heading("group", text="Группа")
-        self.stats_tree.heading("total", text="Всего хостов")
-        self.stats_tree.heading("online", text="Доступно")
-        self.stats_tree.heading("offline", text="Недоступно")
-        self.stats_tree.heading("unknown", text="Неизвестно")
-        
-        self.stats_tree.column("status", width=25)
-        self.stats_tree.column("group", width=150)
-        self.stats_tree.column("total", width=100)
-        self.stats_tree.column("online", width=80)
-        self.stats_tree.column("offline", width=80)
-        self.stats_tree.column("unknown", width=80)
-        
-        # Configure tags for status colors
-        self.stats_tree.tag_configure("status_healthy", foreground="#2ecc71")
-        self.stats_tree.tag_configure("status_warning", foreground="#f39c12")
-        self.stats_tree.tag_configure("status_critical", foreground="#e74c3c")
-        
-        self.stats_tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_change)
+        toolbar.addWidget(self.create_button("Добавить хост", self.show_add_host_dialog))
+        toolbar.addWidget(self.create_button("Редактировать хост", self.show_edit_host_dialog))
+        toolbar.addWidget(self.create_button("Удалить хост", self.remove_host))
+        toolbar.addSpacing(10)
 
-    def on_tab_change(self, event):
-        selected_tab = self.notebook.select()
-        tab_text = self.notebook.tab(selected_tab, "text")
-        if tab_text == "Статистика":
-            self.refresh_stats()
+        toolbar.addWidget(self.create_button("Экспорт (Excel)", self.export_data))
+        toolbar.addWidget(self.create_button("Импорт (Excel)", self.import_data))
+        toolbar.addWidget(self.create_button("Настройки", self.show_settings_dialog))
+        toolbar.addSpacing(10)
 
-    def refresh_stats(self):
-        for item in self.stats_tree.get_children():
-            self.stats_tree.delete(item)
-            
-        stats = self.db.get_all_hosts_stats()
-        for s in stats:
-            tag = f"status_{s['status']}"
-            self.stats_tree.insert("", "end", values=(
-                "●", s["group"], s["total"], s["online"], s["offline"], s["unknown"]
-            ), tags=(tag,))
-        
-        self.update_overall_status()
-    
-    def update_overall_status(self):
-        """Обновить отображение общего статуса."""
-        overall = self.db.get_overall_status()
-        color_map = {
-            "healthy": "#2ecc71",   # зелёный
-            "warning": "#f39c12",   # жёлтый
-            "critical": "#e74c3c"   # красный
-        }
-        
-        self.overall_status_label.config(foreground=color_map.get(overall, "#95a5a6"))
-        
-        status_text_map = {
-            "healthy": "Все системы в норме",
-            "warning": "Есть проблемы (< 1ч)",
-            "critical": "Критичные проблемы (>= 1ч)"
-        }
-        
-        if self.monitoring:
-            # Не перезаписываем статус если идёт мониторинг
-            return
+        toolbar.addWidget(QtWidgets.QLabel("Поиск:"))
+        self.search_input = QtWidgets.QLineEdit()
+        self.search_input.textChanged.connect(self.refresh_table)
+        toolbar.addWidget(self.search_input)
+        toolbar.addWidget(self.create_button("Очистить", self.clear_search))
+        toolbar.addSpacing(10)
 
-    # --- Group Actions ---
-    
-    def load_groups(self):
-        groups = self.db.get_groups()
-        self.group_combo['values'] = groups
-        if groups:
-            if self.current_group and self.current_group in groups:
-                self.group_combo.set(self.current_group)
-            else:
-                self.group_combo.current(0)
-                self.on_group_select(None)
-        else:
-            self.group_combo.set('')
-            self.clear_table()
+        toolbar.addWidget(QtWidgets.QLabel("Фильтр:"))
+        self.filter_combo = QtWidgets.QComboBox()
+        self.filter_combo.addItems([
+            "all",
+            "online",
+            "offline_lt_1h",
+            "offline_ge_1h",
+            "unknown",
+        ])
+        self.filter_combo.currentTextChanged.connect(self.refresh_table)
+        toolbar.addWidget(self.filter_combo)
+        toolbar.addStretch()
 
-    def on_group_select(self, event):
-        self.current_group = self.group_combo.get()
+        self.btn_start = QtWidgets.QPushButton("Старт")
+        self.btn_start.clicked.connect(self.toggle_monitoring)
+        toolbar.addWidget(self.btn_start)
+
+        content = QtWidgets.QSplitter()
+        content.setStretchFactor(0, 3)
+        content.setStretchFactor(1, 1)
+        layout.addWidget(content)
+
+        self.host_table = QtWidgets.QTableWidget(0, 7)
+        self.host_table.setHorizontalHeaderLabels(
+            [
+                "",
+                "Адрес",
+                "Описание",
+                "Подгруппа",
+                "Интервал (сек)",
+                "Задержка (мс)",
+                "Последняя проверка",
+            ]
+        )
+        self.host_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.host_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.host_table.verticalHeader().setVisible(False)
+        self.host_table.horizontalHeader().setStretchLastSection(True)
+        self.host_table.itemSelectionChanged.connect(self.on_host_select)
+        content.addWidget(self.host_table)
+
+        detail_widget = QtWidgets.QWidget()
+        detail_layout = QtWidgets.QVBoxLayout(detail_widget)
+        detail_layout.setContentsMargins(8, 8, 8, 8)
+        detail_layout.setSpacing(8)
+        content.addWidget(detail_widget)
+
+        detail_layout.addWidget(self.section_label("Детали хоста"))
+        self.detail_labels = {}
+        for label in [
+            "Адрес",
+            "Описание",
+            "Подгруппа",
+            "Интервал",
+            "Статус",
+            "Задержка",
+            "Последняя проверка",
+            "Последняя смена",
+        ]:
+            row = QtWidgets.QHBoxLayout()
+            row.addWidget(QtWidgets.QLabel(f"{label}:"))
+            value = QtWidgets.QLabel("—")
+            value.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            row.addWidget(value)
+            row.addStretch()
+            detail_layout.addLayout(row)
+            self.detail_labels[label] = value
+
+        metrics_box = QtWidgets.QGroupBox("Метрики")
+        metrics_layout = QtWidgets.QGridLayout(metrics_box)
+        metrics_layout.setContentsMargins(8, 8, 8, 8)
+        metrics_layout.setHorizontalSpacing(16)
+        metrics_layout.setVerticalSpacing(8)
+        metric_keys = [
+            ("Мин", "min"),
+            ("Макс", "max"),
+            ("Средняя", "avg"),
+            ("Джиттер", "jitter"),
+            ("Потери", "loss"),
+        ]
+        self.metric_labels = {}
+        for idx, (title, key) in enumerate(metric_keys):
+            title_label = QtWidgets.QLabel(title)
+            value_label = QtWidgets.QLabel("—")
+            value_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            metrics_layout.addWidget(title_label, idx // 2, (idx % 2) * 2)
+            metrics_layout.addWidget(value_label, idx // 2, (idx % 2) * 2 + 1)
+            self.metric_labels[key] = value_label
+        detail_layout.addWidget(metrics_box)
+
+        history_button = QtWidgets.QPushButton("История хоста")
+        history_button.clicked.connect(self.show_history_dialog)
+        detail_layout.addWidget(history_button)
+
+        detail_layout.addWidget(self.section_label("График задержек"))
+        self.chart = QChart()
+        self.chart.setBackgroundVisible(False)
+        self.chart.setLegendVisible(False)
+        self.chart_view = QChartView(self.chart)
+        self.chart_view.setRenderHint(QPainter.Antialiasing)
+        detail_layout.addWidget(self.chart_view, 1)
+
+    def build_stats_tab(self):
+        layout = QtWidgets.QVBoxLayout(self.stats_tab)
+        toolbar = QtWidgets.QHBoxLayout()
+        layout.addLayout(toolbar)
+        refresh_button = QtWidgets.QPushButton("Обновить статистику")
+        refresh_button.clicked.connect(self.refresh_stats)
+        toolbar.addWidget(refresh_button)
+        toolbar.addStretch()
+
+        self.stats_table = QtWidgets.QTableWidget(0, 7)
+        self.stats_table.setHorizontalHeaderLabels(
+            ["Мониторинг", "", "Группа", "Всего", "Доступно", "Недоступно", "Неизвестно"]
+        )
+        self.stats_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.stats_table.verticalHeader().setVisible(False)
+        self.stats_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.stats_table)
+
+    def create_button(self, text, callback):
+        button = QtWidgets.QPushButton(text)
+        button.clicked.connect(callback)
+        return button
+
+    def section_label(self, text):
+        label = QtWidgets.QLabel(text)
+        font = label.font()
+        font.setBold(True)
+        label.setFont(font)
+        return label
+
+    def clear_search(self):
+        self.search_input.clear()
         self.refresh_table()
 
-    def create_group_dialog(self):
-        name = tk.simpledialog.askstring("Новая группа", "Введите имя группы:")
-        if name:
+    def load_groups(self):
+        groups = self.db.get_groups()
+        self.group_combo.clear()
+        self.group_combo.addItems(groups)
+        if groups:
+            self.current_group = groups[0]
+            self.group_combo.setCurrentText(self.current_group)
+        else:
+            self.current_group = None
+            self.clear_table()
+        self.refresh_stats()
+
+    def on_group_select(self, group_name):
+        self.current_group = group_name
+        self.selected_host = None
+        self.reset_detail_panel()
+        self.refresh_table()
+
+    def reset_detail_panel(self):
+        for label in self.detail_labels.values():
+            label.setText("—")
+        for label in self.metric_labels.values():
+            label.setText("—")
+        self.clear_chart()
+
+    def clear_table(self):
+        self.host_table.setRowCount(0)
+
+    def match_filter(self, status, offline_since):
+        filter_value = self.filter_combo.currentText()
+        if filter_value == "all":
+            return True
+        if filter_value == "unknown":
+            return status == "Unknown"
+        if filter_value == "online":
+            return status == "Online"
+        if filter_value.startswith("offline"):
+            if status != "Offline":
+                return False
+            if not offline_since:
+                return filter_value == "offline_lt_1h"
             try:
-                self.db.create_group(name)
-                self.load_groups()
-                self.group_combo.set(name)
-                self.on_group_select(None)
-            except ValueError as e:
-                messagebox.showerror("Ошибка", str(e))
+                offline_time = datetime.strptime(offline_since, "%Y-%m-%d %H:%M:%S")
+                diff = (datetime.now() - offline_time).total_seconds()
+            except ValueError:
+                diff = 3600
+            if filter_value == "offline_lt_1h":
+                return diff < 3600
+            if filter_value == "offline_ge_1h":
+                return diff >= 3600
+        return True
+
+    def refresh_table(self):
+        self.host_table.setRowCount(0)
+        if not self.current_group:
+            return
+
+        search_text = self.search_input.text().strip().lower()
+        hosts = self.db.get_hosts(self.current_group)
+        self.host_row_map = {}
+
+        for host in hosts:
+            address, desc, subgroup, interval_sec, last_ping_time, offline_since = host
+            if search_text:
+                haystack = " ".join(
+                    [str(address), str(desc or ""), str(subgroup or "")]
+                ).lower()
+                if search_text not in haystack:
+                    continue
+
+            status = self.db.get_last_status(self.current_group, address)
+            if not self.match_filter(status, offline_since):
+                continue
+
+            self.host_status_cache[address] = (status, offline_since)
+
+            interval_value = interval_sec if interval_sec else self.default_interval_seconds
+            recent = self.db.get_recent_results(self.current_group, address, limit=1)
+            last_latency = recent[-1][2] if recent else None
+            latency_ms = f"{last_latency * 1000:.0f}" if last_latency else "-"
+            last_check_display = last_ping_time or "-"
+
+            row = self.host_table.rowCount()
+            self.host_table.insertRow(row)
+            self.host_table.setItem(row, 0, QtWidgets.QTableWidgetItem("●"))
+            self.host_table.setItem(row, 1, QtWidgets.QTableWidgetItem(address))
+            self.host_table.setItem(row, 2, QtWidgets.QTableWidgetItem(desc or ""))
+            self.host_table.setItem(row, 3, QtWidgets.QTableWidgetItem(subgroup or ""))
+            self.host_table.setItem(row, 4, QtWidgets.QTableWidgetItem(str(interval_value)))
+            self.host_table.setItem(row, 5, QtWidgets.QTableWidgetItem(latency_ms))
+            self.host_table.setItem(row, 6, QtWidgets.QTableWidgetItem(last_check_display))
+            self.host_row_map[address] = row
+
+    def refresh_stats(self):
+        self.stats_table.setRowCount(0)
+        active_map = self.db.get_groups_with_status()
+        stats = self.db.get_all_hosts_stats()
+
+        for entry in stats:
+            row = self.stats_table.rowCount()
+            self.stats_table.insertRow(row)
+
+            checkbox = QtWidgets.QCheckBox()
+            checkbox.setChecked(active_map.get(entry["group"], False))
+            checkbox.stateChanged.connect(
+                lambda state, group=entry["group"]: self.db.set_group_active(group, state == QtCore.Qt.Checked)
+            )
+            checkbox.stateChanged.connect(lambda _: self.refresh_stats())
+            self.stats_table.setCellWidget(row, 0, checkbox)
+            self.stats_table.setItem(row, 1, QtWidgets.QTableWidgetItem("●"))
+            self.stats_table.setItem(row, 2, QtWidgets.QTableWidgetItem(entry["group"]))
+            self.stats_table.setItem(row, 3, QtWidgets.QTableWidgetItem(str(entry["total"])))
+            self.stats_table.setItem(row, 4, QtWidgets.QTableWidgetItem(str(entry["online"])))
+            self.stats_table.setItem(row, 5, QtWidgets.QTableWidgetItem(str(entry["offline"])))
+            self.stats_table.setItem(row, 6, QtWidgets.QTableWidgetItem(str(entry["unknown"])))
+
+    def update_overall_status(self):
+        overall = self.db.get_overall_status()
+        color_map = {
+            "healthy": "#2ecc71",
+            "warning": "#f39c12",
+            "critical": "#e74c3c",
+        }
+        self.overall_status_label.setStyleSheet(
+            f"color: {color_map.get(overall, '#95a5a6')};"
+        )
+
+    def show_single_dialog(self, current_dialog, builder):
+        if current_dialog is not None and current_dialog.isVisible():
+            current_dialog.raise_()
+            current_dialog.activateWindow()
+            return current_dialog
+        dialog = builder()
+        dialog.show()
+        return dialog
+
+    def show_create_group_dialog(self):
+        def build():
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("Новая группа")
+            dialog.setFixedSize(300, 160)
+            layout = QtWidgets.QVBoxLayout(dialog)
+            layout.addWidget(QtWidgets.QLabel("Имя группы:"))
+            name_input = QtWidgets.QLineEdit()
+            layout.addWidget(name_input)
+            button = QtWidgets.QPushButton("Создать")
+            layout.addWidget(button)
+
+            def save():
+                name = name_input.text().strip()
+                if not name:
+                    return
+                try:
+                    self.db.create_group(name)
+                    self.load_groups()
+                    self.group_combo.setCurrentText(name)
+                    dialog.accept()
+                except ValueError as exc:
+                    QtWidgets.QMessageBox.warning(dialog, "Ошибка", str(exc))
+
+            button.clicked.connect(save)
+            return dialog
+
+        self.create_group_dialog_ref = self.show_single_dialog(
+            self.create_group_dialog_ref, build
+        )
+
+    def show_add_host_dialog(self):
+        if not self.current_group:
+            QtWidgets.QMessageBox.warning(self, "Внимание", "Выберите группу.")
+            return
+
+        def build():
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("Добавить хост")
+            dialog.setFixedSize(350, 340)
+            layout = QtWidgets.QFormLayout(dialog)
+            addr_input = QtWidgets.QLineEdit()
+            desc_input = QtWidgets.QLineEdit()
+            sub_input = QtWidgets.QLineEdit()
+            interval_input = QtWidgets.QLineEdit(str(self.default_interval_seconds))
+            layout.addRow("Адрес (IP/Домен):", addr_input)
+            layout.addRow("Описание:", desc_input)
+            layout.addRow("Подгруппа:", sub_input)
+            layout.addRow("Интервал пинга (секунды):", interval_input)
+            save_button = QtWidgets.QPushButton("Сохранить")
+            layout.addRow(save_button)
+
+            def save():
+                try:
+                    interval_seconds = int(interval_input.text())
+                    if interval_seconds <= 0:
+                        raise ValueError("Интервал должен быть больше 0 секунд.")
+                    self.db.add_host(
+                        self.current_group,
+                        addr_input.text(),
+                        desc_input.text(),
+                        sub_input.text() or None,
+                        interval_seconds,
+                    )
+                    self.refresh_table()
+                    dialog.accept()
+                except ValueError as exc:
+                    QtWidgets.QMessageBox.warning(dialog, "Ошибка", str(exc))
+                except sqlite3.Error as exc:
+                    QtWidgets.QMessageBox.warning(dialog, "Ошибка БД", str(exc))
+
+            save_button.clicked.connect(save)
+            return dialog
+
+        self.add_host_dialog = self.show_single_dialog(self.add_host_dialog, build)
+
+    def show_edit_host_dialog(self):
+        if not self.current_group:
+            QtWidgets.QMessageBox.warning(self, "Внимание", "Выберите группу.")
+            return
+
+        selected_items = self.host_table.selectedItems()
+        if not selected_items:
+            QtWidgets.QMessageBox.warning(self, "Внимание", "Выберите хост.")
+            return
+        address = selected_items[1].text()
+        hosts = self.db.get_hosts(self.current_group)
+        host_map = {h[0]: h for h in hosts}
+        host_data = host_map.get(address)
+        if not host_data:
+            return
+
+        def build():
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("Редактировать хост")
+            dialog.setFixedSize(350, 340)
+            layout = QtWidgets.QFormLayout(dialog)
+            addr_input = QtWidgets.QLineEdit(host_data[0])
+            addr_input.setEnabled(False)
+            desc_input = QtWidgets.QLineEdit(host_data[1] or "")
+            sub_input = QtWidgets.QLineEdit(host_data[2] or "")
+            interval_seconds = host_data[3] if host_data[3] else self.default_interval_seconds
+            interval_input = QtWidgets.QLineEdit(str(interval_seconds))
+            layout.addRow("Адрес (IP/Домен):", addr_input)
+            layout.addRow("Описание:", desc_input)
+            layout.addRow("Подгруппа:", sub_input)
+            layout.addRow("Интервал пинга (секунды):", interval_input)
+            save_button = QtWidgets.QPushButton("Сохранить")
+            layout.addRow(save_button)
+
+            def save():
+                try:
+                    interval_value = int(interval_input.text())
+                    if interval_value <= 0:
+                        raise ValueError("Интервал должен быть больше 0 секунд.")
+                    self.db.update_host(
+                        self.current_group,
+                        host_data[0],
+                        desc_input.text(),
+                        sub_input.text() or None,
+                        interval_value,
+                    )
+                    self.refresh_table()
+                    dialog.accept()
+                except ValueError as exc:
+                    QtWidgets.QMessageBox.warning(dialog, "Ошибка", str(exc))
+                except sqlite3.Error as exc:
+                    QtWidgets.QMessageBox.warning(dialog, "Ошибка БД", str(exc))
+
+            save_button.clicked.connect(save)
+            return dialog
+
+        self.edit_host_dialog = self.show_single_dialog(self.edit_host_dialog, build)
+
+    def show_settings_dialog(self):
+        def build():
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("Настройки")
+            dialog.setFixedSize(360, 320)
+            layout = QtWidgets.QFormLayout(dialog)
+            default_interval_input = QtWidgets.QLineEdit(str(self.default_interval_seconds))
+            monitor_interval_input = QtWidgets.QLineEdit(str(self.monitor_interval))
+            ping_timeout_input = QtWidgets.QLineEdit(str(self.ping_timeout))
+            batch_size_input = QtWidgets.QLineEdit(str(self.batch_size))
+            max_workers_input = QtWidgets.QLineEdit(str(self.max_workers))
+            layout.addRow("Интервал по умолчанию (сек)", default_interval_input)
+            layout.addRow("Интервал цикла мониторинга (сек)", monitor_interval_input)
+            layout.addRow("Таймаут пинга (сек)", ping_timeout_input)
+            layout.addRow("Размер пачки пингов", batch_size_input)
+            layout.addRow("Макс. потоков пинга", max_workers_input)
+            save_button = QtWidgets.QPushButton("Сохранить")
+            layout.addRow(save_button)
+
+            def save():
+                try:
+                    default_interval = int(default_interval_input.text())
+                    monitor_interval = float(monitor_interval_input.text())
+                    ping_timeout = float(ping_timeout_input.text())
+                    batch_size = int(batch_size_input.text())
+                    max_workers = int(max_workers_input.text())
+
+                    if default_interval <= 0 or monitor_interval <= 0 or ping_timeout <= 0:
+                        raise ValueError("Интервалы и таймаут должны быть больше 0.")
+                    if batch_size <= 0 or max_workers <= 0:
+                        raise ValueError("Размеры должны быть больше 0.")
+
+                    self.db.set_setting("default_interval_seconds", default_interval)
+                    self.db.set_setting("monitor_interval_seconds", monitor_interval)
+                    self.db.set_setting("ping_timeout_seconds", ping_timeout)
+                    self.db.set_setting("ping_batch_size", batch_size)
+                    self.db.set_setting("max_ping_workers", max_workers)
+
+                    self.load_settings()
+                    dialog.accept()
+                except ValueError as exc:
+                    QtWidgets.QMessageBox.warning(dialog, "Ошибка", str(exc))
+
+            save_button.clicked.connect(save)
+            return dialog
+
+        self.settings_dialog = self.show_single_dialog(self.settings_dialog, build)
+
+    def show_history_dialog(self):
+        if not self.selected_host:
+            QtWidgets.QMessageBox.warning(self, "Внимание", "Выберите хост.")
+            return
+
+        group, address = self.selected_host
+
+        def build():
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle(f"История хоста {address}")
+            dialog.resize(700, 500)
+            layout = QtWidgets.QVBoxLayout(dialog)
+            layout.addWidget(QtWidgets.QLabel(f"Группа: {group}"))
+
+            change_box = QtWidgets.QGroupBox("Смена статуса")
+            change_layout = QtWidgets.QVBoxLayout(change_box)
+            change_table = QtWidgets.QTableWidget(0, 2)
+            change_table.setHorizontalHeaderLabels(["Время", "Статус"])
+            change_table.verticalHeader().setVisible(False)
+            change_table.horizontalHeader().setStretchLastSection(True)
+            change_layout.addWidget(change_table)
+            layout.addWidget(change_box)
+
+            history_box = QtWidgets.QGroupBox("Полная история")
+            history_layout = QtWidgets.QVBoxLayout(history_box)
+            history_table = QtWidgets.QTableWidget(0, 3)
+            history_table.setHorizontalHeaderLabels(["Время", "Статус", "Задержка (мс)"])
+            history_table.verticalHeader().setVisible(False)
+            history_table.horizontalHeader().setStretchLastSection(True)
+            history_layout.addWidget(history_table)
+            layout.addWidget(history_box)
+
+            results = self.db.get_recent_results(group, address, limit=200)
+            last_status = None
+            for timestamp, status, latency in results:
+                latency_ms = f"{latency * 1000:.0f}" if latency else "-"
+                row = history_table.rowCount()
+                history_table.insertRow(row)
+                history_table.setItem(row, 0, QtWidgets.QTableWidgetItem(timestamp))
+                history_table.setItem(row, 1, QtWidgets.QTableWidgetItem(status))
+                history_table.setItem(row, 2, QtWidgets.QTableWidgetItem(latency_ms))
+
+                if status != last_status:
+                    change_row = change_table.rowCount()
+                    change_table.insertRow(change_row)
+                    change_table.setItem(change_row, 0, QtWidgets.QTableWidgetItem(timestamp))
+                    change_table.setItem(change_row, 1, QtWidgets.QTableWidgetItem(status))
+                    last_status = status
+
+            return dialog
+
+        self.history_dialog = self.show_single_dialog(self.history_dialog, build)
 
     def delete_group(self):
         if not self.current_group:
             return
-        if messagebox.askyesno("Подтверждение", f"Удалить группу '{self.current_group}'?"):
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Подтверждение",
+            f"Удалить группу '{self.current_group}'?",
+        )
+        if reply == QtWidgets.QMessageBox.Yes:
             self.db.delete_group(self.current_group)
             self.current_group = None
             self.load_groups()
 
-    # --- Host Actions ---
-
-    def add_host_dialog(self):
-        if not self.current_group:
-            messagebox.showwarning("Внимание", "Сначала создайте или выберите группу.")
-            return
-            
-        dialog = tk.Toplevel(self)
-        dialog.title("Добавить хост")
-        dialog.geometry("350x320")
-        
-        ttk.Label(dialog, text="Адрес (IP/Домен):").pack(pady=5)
-        addr_entry = ttk.Entry(dialog, width=30)
-        addr_entry.pack(pady=5)
-        
-        ttk.Label(dialog, text="Описание:").pack(pady=5)
-        desc_entry = ttk.Entry(dialog, width=30)
-        desc_entry.pack(pady=5)
-        
-        ttk.Label(dialog, text="Подгруппа (необязательно):").pack(pady=5)
-        sub_entry = ttk.Entry(dialog, width=30)
-        sub_entry.pack(pady=5)
-
-        ttk.Label(dialog, text="Интервал пинга (минуты, стандарт 10):").pack(pady=5)
-        interval_var = tk.StringVar(value="10")
-        interval_entry = ttk.Entry(dialog, width=30, textvariable=interval_var)
-        interval_entry.pack(pady=5)
-
-        def save():
-            try:
-                interval_minutes = int(interval_var.get())
-                interval_seconds = interval_minutes * 60
-                self.db.add_host(
-                    self.current_group,
-                    addr_entry.get(),
-                    desc_entry.get(),
-                    sub_entry.get() or None,
-                    interval_seconds
-                )
-                self.refresh_table()
-                dialog.destroy()
-            except ValueError as e:
-                messagebox.showerror("Ошибка", str(e))
-            except sqlite3.Error as e:
-                messagebox.showerror("Ошибка БД", str(e))
-
-        ttk.Button(dialog, text="Сохранить", command=save).pack(pady=10)
-
     def remove_host(self):
-        selected_item = self.tree.selection()
-        if not selected_item:
+        selected_items = self.host_table.selectedItems()
+        if not selected_items:
             return
-        
-        for item_id in selected_item:
-            item = self.tree.item(item_id)
-            address = item['values'][1]  # address is at index 1 (after status_indicator)
-            self.db.remove_host(self.current_group, address)
-        
+        address = selected_items[1].text()
+        self.db.remove_host(self.current_group, address)
         self.refresh_table()
 
     def export_data(self):
         if not self.current_group:
             return
-        
         if not HAS_OPENPYXL:
-            messagebox.showerror("Ошибка", "openpyxl не установлен. Невозможно экспортировать.")
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "openpyxl не установлен.")
             return
-        
-        filename = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel Files", "*.xlsx")])
-        
+        filename, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Экспорт", "", "Excel Files (*.xlsx)"
+        )
         if filename:
-            try:
-                wb = Workbook()
-                ws = wb.active
-                ws.title = "hosts"
-                
-                ws.append(["address", "description", "subgroup", "ping_interval_min"])
-                hosts = self.db.get_hosts(self.current_group)
-                for h in hosts:
-                    # h[3] is ping_interval in seconds, convert to minutes
-                    interval_min = h[3] // 60 if h[3] else 10
-                    ws.append([h[0], h[1], h[2] or "", interval_min])
-                
-                # Auto-adjust column widths
-                for col in ws.columns:
-                    max_length = 0
-                    for cell in col:
-                        try:
-                            if len(str(cell.value)) > max_length:
-                                max_length = len(str(cell.value))
-                        except:
-                            pass
-                    adjusted_width = min(max_length + 2, 50)
-                    ws.column_dimensions[get_column_letter(col[0].column)].width = adjusted_width
-                
-                wb.save(filename)
-                messagebox.showinfo("Успех", "Данные экспортированы в Excel.")
-            except Exception as e:
-                messagebox.showerror("Ошибка", str(e))
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "hosts"
+            ws.append(["address", "description", "subgroup", "ping_interval_sec"])
+            hosts = self.db.get_hosts(self.current_group)
+            for h in hosts:
+                interval_sec = h[3] if h[3] else self.default_interval_seconds
+                ws.append([h[0], h[1], h[2] or "", interval_sec])
+            for col in ws.columns:
+                max_length = 0
+                for cell in col:
+                    cell_value = str(cell.value) if cell.value is not None else ""
+                    max_length = max(max_length, len(cell_value))
+                adjusted_width = min(max_length + 2, 50)
+                ws.column_dimensions[get_column_letter(col[0].column)].width = adjusted_width
+            wb.save(filename)
 
     def import_data(self):
         if not self.current_group:
-            messagebox.showwarning("Внимание", "Выберите группу.")
+            QtWidgets.QMessageBox.warning(self, "Внимание", "Выберите группу.")
             return
-        
         if not HAS_OPENPYXL:
-            messagebox.showerror("Ошибка", "openpyxl не установлен. Невозможно импортировать.")
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "openpyxl не установлен.")
             return
-        
-        filename = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsx")])
-        
+        filename, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Импорт", "", "Excel Files (*.xlsx)"
+        )
         if filename:
-            try:
-                wb = load_workbook(filename)
-                ws = wb.active
-                
-                rows = list(ws.iter_rows(values_only=True))
-                if not rows:
-                    return
-                
-                for row in rows[1:]:
-                    if row and len(row) >= 2:
-                        addr = row[0]
-                        desc = row[1]
-                        sub = row[2] if len(row) > 2 else None
-                        interval_min = int(row[3]) if len(row) > 3 and row[3] else 10
-                        interval_sec = interval_min * 60
-                        if addr:
-                            self.db.add_host(self.current_group, addr, desc, sub, interval_sec)
-                
-                self.refresh_table()
-                messagebox.showinfo("Успех", "Данные импортированы из Excel.")
-            except Exception as e:
-                messagebox.showerror("Ошибка", str(e))
+            wb = load_workbook(filename)
+            ws = wb.active
+            rows = list(ws.iter_rows(values_only=True))
+            if not rows:
+                return
+            headers = [str(cell).strip().lower() if cell else "" for cell in rows[0]]
+            interval_is_minutes = "ping_interval_min" in headers
+            for row in rows[1:]:
+                if row and len(row) >= 2:
+                    addr = row[0]
+                    desc = row[1]
+                    sub = row[2] if len(row) > 2 else None
+                    interval_value = (
+                        int(row[3]) if len(row) > 3 and row[3] else self.default_interval_seconds
+                    )
+                    interval_sec = interval_value * 60 if interval_is_minutes else interval_value
+                    if addr:
+                        self.db.add_host(self.current_group, addr, desc, sub, interval_sec)
+            self.refresh_table()
 
-    def get_status_color(self, address):
-        """Определить цвет индикатора на основе статуса и времени."""
-        if address not in self.host_status_cache:
-            return "gray"  # unknown
-        
-        status, offline_since = self.host_status_cache[address]
-        
-        if status == "Online":
-            return "green"
-        elif status == "Offline":
-            if offline_since:
-                try:
-                    offline_time = datetime.strptime(offline_since, "%Y-%m-%d %H:%M:%S")
-                    now = datetime.now()
-                    diff = (now - offline_time).total_seconds()
-                    if diff < 3600:  # < 1 часа
-                        return "yellow"
-                    else:
-                        return "red"
-                except:
-                    return "red"
-            else:
-                return "red"
-        else:
-            return "gray"
-
-    def refresh_table(self):
-        self.clear_table()
-        if not self.current_group:
+    def on_host_select(self):
+        selected_items = self.host_table.selectedItems()
+        if not selected_items:
             return
-        
+        address = selected_items[1].text()
+        self.selected_host = (self.current_group, address)
+        self.update_detail_panel(address)
+        self.update_chart()
+
+    def update_detail_panel(self, address):
+        if not self.current_group or not address:
+            return
         hosts = self.db.get_hosts(self.current_group)
-        for host in hosts:
-            address, desc, subgroup, interval_sec, last_ping_time, offline_since = host
-            
-            # Get last status from cache or DB
-            self.db.cursor.execute("""
-                SELECT status FROM ping_results 
-                WHERE group_name = ? AND address = ? 
-                ORDER BY id DESC LIMIT 1
-            """, (self.current_group, address))
-            row = self.db.cursor.fetchone()
-            status = row[0] if row else "Unknown"
-            
-            # Store in cache
-            self.host_status_cache[address] = (status, offline_since)
-            
-            # Convert interval to minutes for display
-            interval_min = interval_sec // 60 if interval_sec else 10
-            
-            # Get color and set tag
-            color_name = self.get_status_color(address)
-            tag = f"status_{color_name}"
-            
-            # Insert with placeholder for status indicator
-            self.tree.insert("", "end", values=("●", address, desc, subgroup or "", interval_min, "-", ""), tags=(tag,))
+        host_map = {h[0]: h for h in hosts}
+        host_data = host_map.get(address)
+        if not host_data:
+            return
 
-    def clear_table(self):
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+        address, desc, subgroup, interval_sec, last_ping_time, _ = host_data
+        status = self.db.get_last_status(self.current_group, address)
+        recent_results = self.db.get_recent_results(self.current_group, address, limit=50)
+        latest_latency = recent_results[-1][2] if recent_results else None
+        last_status, last_change_time = self.db.get_last_status_change(
+            self.current_group, address
+        )
 
-    # --- Monitoring ---
+        latencies = [row[2] for row in recent_results if row[2] is not None]
+        loss_count = sum(1 for row in recent_results if row[1] == "Offline")
+        total_count = len(recent_results)
+        jitter = None
+        if len(latencies) > 1:
+            diffs = [abs(latencies[i] - latencies[i - 1]) for i in range(1, len(latencies))]
+            jitter = sum(diffs) / len(diffs)
+
+        self.detail_labels["Адрес"].setText(address)
+        self.detail_labels["Описание"].setText(desc or "—")
+        self.detail_labels["Подгруппа"].setText(subgroup or "—")
+        interval_value = interval_sec if interval_sec else self.default_interval_seconds
+        self.detail_labels["Интервал"].setText(f"{interval_value} сек")
+        self.detail_labels["Статус"].setText(status)
+        self.detail_labels["Задержка"].setText(
+            f"{latest_latency * 1000:.0f} мс" if latest_latency else "—"
+        )
+        self.detail_labels["Последняя проверка"].setText(last_ping_time or "—")
+        if last_status and last_change_time:
+            self.detail_labels["Последняя смена"].setText(
+                f"{last_status} в {last_change_time}"
+            )
+        else:
+            self.detail_labels["Последняя смена"].setText("—")
+
+        if latencies:
+            self.metric_labels["min"].setText(f"{min(latencies) * 1000:.0f} мс")
+            self.metric_labels["max"].setText(f"{max(latencies) * 1000:.0f} мс")
+            self.metric_labels["avg"].setText(
+                f"{(sum(latencies) / len(latencies)) * 1000:.0f} мс"
+            )
+        else:
+            self.metric_labels["min"].setText("—")
+            self.metric_labels["max"].setText("—")
+            self.metric_labels["avg"].setText("—")
+
+        self.metric_labels["jitter"].setText(
+            f"{jitter * 1000:.0f} мс" if jitter is not None else "—"
+        )
+        if total_count > 0:
+            self.metric_labels["loss"].setText(f"{(loss_count / total_count) * 100:.1f}%")
+        else:
+            self.metric_labels["loss"].setText("—")
+
+    def clear_chart(self):
+        self.chart.removeAllSeries()
+        self.chart.createDefaultAxes()
+
+    def update_chart(self):
+        self.chart.removeAllSeries()
+        if not self.selected_host:
+            return
+        group, address = self.selected_host
+        data = self.db.get_recent_results(group, address, limit=50)
+        if not data:
+            return
+
+        line_series = QLineSeries()
+        point_series = QScatterSeries()
+        point_series.setMarkerSize(6.0)
+        offline_series = QScatterSeries()
+        offline_series.setMarkerSize(8.0)
+        offline_series.setColor(QtCore.Qt.red)
+
+        x_values = list(range(len(data)))
+        latencies_ms = [row[2] * 1000 for row in data if row[2] is not None]
+        min_latency = min(latencies_ms) if latencies_ms else 0
+        max_latency = max(latencies_ms) if latencies_ms else 1
+
+        for idx, (_, status, latency) in enumerate(data):
+            if latency is None:
+                offline_series.append(idx, min_latency)
+                continue
+            latency_ms = latency * 1000
+            line_series.append(idx, latency_ms)
+            point_series.append(idx, latency_ms)
+
+        self.chart.addSeries(line_series)
+        self.chart.addSeries(point_series)
+        self.chart.addSeries(offline_series)
+
+        axis_x = QValueAxis()
+        axis_x.setRange(0, max(len(data) - 1, 1))
+        axis_x.setTickCount(5)
+        axis_x.setLabelFormat("%d")
+        axis_x.setTitleText("Точки")
+
+        axis_y = QValueAxis()
+        axis_y.setRange(min_latency, max_latency if max_latency > min_latency else min_latency + 1)
+        axis_y.setLabelFormat("%d")
+        axis_y.setTitleText("мс")
+
+        self.chart.addAxis(axis_x, QtCore.Qt.AlignBottom)
+        self.chart.addAxis(axis_y, QtCore.Qt.AlignLeft)
+        line_series.attachAxis(axis_x)
+        line_series.attachAxis(axis_y)
+        point_series.attachAxis(axis_x)
+        point_series.attachAxis(axis_y)
+        offline_series.attachAxis(axis_x)
+        offline_series.attachAxis(axis_y)
 
     def toggle_monitoring(self):
         if self.monitoring:
             self.monitoring = False
-            self.btn_start.configure(text="Старт")
-            self.status_var.set("Мониторинг остановлен")
+            self.btn_start.setText("Старт")
+            self.status_label.setText("Мониторинг остановлен")
         else:
-            if not self.current_group:
-                messagebox.showwarning("Внимание", "Выберите группу.")
+            if not self.db.get_active_groups():
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Внимание",
+                    "Нет активных групп для мониторинга. Включите группы на вкладке 'Статистика'.",
+                )
                 return
             self.monitoring = True
-            self.btn_start.configure(text="Стоп")
-            self.status_var.set("Мониторинг запущен...")
+            self.btn_start.setText("Стоп")
+            self.status_label.setText("Мониторинг запущен...")
             self.monitor_thread = threading.Thread(target=self.monitoring_loop, daemon=True)
             self.monitor_thread.start()
 
+    def is_due(self, last_ping_time, interval_seconds, now):
+        if not last_ping_time:
+            return True
+        try:
+            last_time = datetime.strptime(last_ping_time, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return True
+        return (now - last_time).total_seconds() >= interval_seconds
+
+    def chunk_hosts(self, hosts, chunk_size):
+        for i in range(0, len(hosts), chunk_size):
+            yield hosts[i : i + chunk_size]
+
+    def ping_hosts_batch(self, hosts_batch):
+        entries = []
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_host = {
+                executor.submit(ping_host_subprocess, host[1], self.ping_timeout): host
+                for host in hosts_batch
+            }
+            for future in concurrent.futures.as_completed(future_to_host):
+                host = future_to_host[future]
+                group_name, address, subgroup = host
+                try:
+                    success, latency = future.result()
+                    status = "Online" if success else "Offline"
+                    entries.append(
+                        {
+                            "timestamp": timestamp,
+                            "group_name": group_name,
+                            "subgroup": subgroup,
+                            "address": address,
+                            "status": status,
+                            "latency": latency,
+                        }
+                    )
+                except Exception:
+                    entries.append(
+                        {
+                            "timestamp": timestamp,
+                            "group_name": group_name,
+                            "subgroup": subgroup,
+                            "address": address,
+                            "status": "Offline",
+                            "latency": None,
+                        }
+                    )
+        return entries
+
     def monitoring_loop(self):
         while self.monitoring:
-            if not self.current_group:
-                break
-            
-            hosts = self.db.get_hosts(self.current_group) 
-            if not hosts:
-                time.sleep(1)
+            groups = self.db.get_active_groups()
+            if not groups:
+                time.sleep(self.monitor_interval)
                 continue
 
-            addresses = [h[0] for h in hosts]
+            now = datetime.now()
+            due_hosts = []
+            for group in groups:
+                hosts = self.db.get_hosts(group)
+                for host in hosts:
+                    address, _, subgroup, interval_sec, last_ping_time, _ = host
+                    interval_sec = interval_sec or self.default_interval_seconds
+                    if self.is_due(last_ping_time, interval_sec, now):
+                        due_hosts.append((group, address, subgroup))
 
-            if HAS_MULTIPING:
-                try:
-                    responses, no_responses = multi_ping(addresses, timeout=1, retry=1, ignore_lookup_errors=True)
-                    
-                    timestamp = datetime.now().strftime("%H:%M:%S")
+            if due_hosts:
+                for batch in self.chunk_hosts(due_hosts, self.batch_size):
+                    if not self.monitoring:
+                        break
+                    results = self.ping_hosts_batch(batch)
+                    self.db.log_results_batch(results)
+                    for result in results:
+                        self.ui_queue.put(
+                            {
+                                "type": "row",
+                                "group": result["group_name"],
+                                "address": result["address"],
+                                "status": result["status"],
+                                "latency": result["latency"],
+                                "timestamp": result["timestamp"],
+                            }
+                        )
 
-                    for addr, latency in responses.items():
-                        if not self.monitoring: break
-                        self.db.log_result(self.current_group, None, addr, "Online", latency)
-                        self.update_row(addr, "Online", f"{latency:.3f}", timestamp)
+            now_ts = time.time()
+            if now_ts - self.last_stats_refresh >= STATS_REFRESH_INTERVAL:
+                self.ui_queue.put({"type": "stats"})
+                self.ui_queue.put({"type": "overall"})
+                self.last_stats_refresh = now_ts
 
-                    for addr in no_responses:
-                        if not self.monitoring: break
-                        self.db.log_result(self.current_group, None, addr, "Offline", None)
-                        self.update_row(addr, "Offline", "-", timestamp)
+            time.sleep(self.monitor_interval)
 
-                except Exception as e:
-                    print(f"Multiping error: {e}")
-            else:
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-                    future_to_addr = {executor.submit(ping_host_subprocess, h[0]): h for h in hosts}
-                    for future in concurrent.futures.as_completed(future_to_addr):
-                        if not self.monitoring: break
-                        host_data = future_to_addr[future]
-                        address = host_data[0]
-                        try:
-                            success, latency = future.result()
-                            status = "Online" if success else "Offline"
-                            latency_str = f"{latency:.3f}" if latency else "-"
-                            timestamp = datetime.now().strftime("%H:%M:%S")
-                            self.db.log_result(self.current_group, None, address, status, latency)
-                            self.update_row(address, status, latency_str, timestamp)
-                        except Exception:
-                            pass
+    def update_row(self, group, address, status, latency, timestamp):
+        if self.current_group != group:
+            return
+        row = self.host_row_map.get(address)
+        if row is None:
+            return
 
-            if self.monitoring:
-                try:
-                    selected = self.notebook.select()
-                    if self.notebook.tab(selected, "text") == "Статистика":
-                         self.refresh_stats()
-                    # Периодически обновляем общий статус
-                    self.update_overall_status()
-                except:
-                    pass
-                time.sleep(self.monitor_interval)
+        offline_since = self.host_status_cache.get(address, ("Unknown", None))[1]
+        if status == "Offline" and offline_since is None:
+            offline_since = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        elif status == "Online":
+            offline_since = None
 
-    def update_row(self, address, status, latency, timestamp):
-        try:
-            for item_id in self.tree.get_children():
-                vals = self.tree.item(item_id)['values']
-                if vals and str(vals[1]) == str(address):  # address is at index 1
-                    # Update cache with new status
-                    offline_since = self.host_status_cache.get(address, ("Unknown", None))[1]
-                    if status == "Offline" and offline_since is None:
-                        offline_since = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    elif status == "Online":
-                        offline_since = None
-                    
-                    self.host_status_cache[address] = (status, offline_since)
-                    
-                    # Get color based on new status
-                    color = self.get_status_color(address)
-                    tag = f"status_{color}"
-                    
-                    # Create colored indicator
-                    indicator = "●"
-                    
-                    new_vals = (indicator, vals[1], vals[2], vals[3], vals[4], latency, timestamp)
-                    self.tree.item(item_id, values=new_vals, tags=(tag,))
-                    break
-        except Exception:
-            pass
+        self.host_status_cache[address] = (status, offline_since)
+        latency_str = f"{latency * 1000:.0f}" if latency else "-"
+
+        self.host_table.setItem(row, 5, QtWidgets.QTableWidgetItem(latency_str))
+        self.host_table.setItem(row, 6, QtWidgets.QTableWidgetItem(timestamp))
+
+        if self.selected_host == (group, address):
+            self.update_detail_panel(address)
+            self.update_chart()
+
+    def process_ui_queue(self):
+        while True:
+            try:
+                event = self.ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            if event["type"] == "row":
+                self.update_row(
+                    event["group"],
+                    event["address"],
+                    event["status"],
+                    event["latency"],
+                    event["timestamp"],
+                )
+            elif event["type"] == "stats":
+                self.refresh_stats()
+            elif event["type"] == "overall":
+                self.update_overall_status()
+
 
 if __name__ == "__main__":
-    app = PingApp()
-    app.mainloop()
+    app = QtWidgets.QApplication([])
+    window = PingApp()
+    window.show()
+    app.exec()

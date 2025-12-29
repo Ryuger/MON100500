@@ -4,6 +4,6 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.11"
 dependencies = [
-    "multiping>=1.1.2",
     "openpyxl>=3.1.5",
+    "pyside6>=6.7.0",
 ]
