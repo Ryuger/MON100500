@@ -1,5 +1,3 @@
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
 import sqlite3
 import subprocess
 import platform
@@ -9,6 +7,10 @@ import re
 import queue
 import concurrent.futures
 from datetime import datetime
+
+from PySide6 import QtCore, QtWidgets
+from PySide6.QtCharts import QChart, QChartView, QLineSeries, QScatterSeries, QValueAxis
+from PySide6.QtGui import QPainter
 
 try:
     from openpyxl import Workbook, load_workbook
@@ -26,7 +28,6 @@ STATS_REFRESH_INTERVAL = 5
 
 
 def clean_address(address):
-    """Очистка и проверка адреса хоста."""
     address = address.strip()
     if not address:
         raise ValueError("Адрес не может быть пустым.")
@@ -48,7 +49,6 @@ def clean_address(address):
 
 
 def clean_group_name(group_name):
-    """Очистка имени группы или подгруппы."""
     group_name = group_name.strip()
     if not group_name:
         raise ValueError("Имя группы не может быть пустым.")
@@ -159,7 +159,7 @@ class DatabaseManager:
                 if not group_name:
                     continue
                 self.cursor.execute(
-                    "INSERT OR IGNORE INTO groups (group_name) VALUES (?)",
+                    "INSERT OR IGNORE INTO groups (group_name, active) VALUES (?, 0)",
                     (group_name,),
                 )
                 self.cursor.execute(
@@ -433,19 +433,7 @@ class DatabaseManager:
                 )
             self.conn.commit()
 
-    def log_result(self, group_name, subgroup, address, status, latency=None):
-        entry = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "group_name": group_name,
-            "subgroup": subgroup,
-            "address": address,
-            "status": status,
-            "latency": latency,
-        }
-        self.log_results_batch([entry])
-
     def get_all_hosts_stats(self):
-        """Возвращает статистику по всем группам с их статусами."""
         with self.lock:
             self.cursor.execute(
                 """
@@ -544,7 +532,6 @@ class DatabaseManager:
 
 
 def ping_host_subprocess(address, timeout=1.0):
-    """Пингует хост, используя системную утилиту ping."""
     param = "-n" if platform.system().lower() == "windows" else "-c"
     timeout_param = "-w" if platform.system().lower() == "windows" else "-W"
 
@@ -581,16 +568,11 @@ def ping_host_subprocess(address, timeout=1.0):
         return False, None
 
 
-class PingApp(tk.Tk):
+class PingApp(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.title("Ping Monitor")
-        self.geometry("1200x650")
-
-        self.style = ttk.Style()
-        self.style.theme_use("clam")
-        self.configure(bg="#0b0f15")
-        self.apply_theme()
+        self.setWindowTitle("Ping Monitor")
+        self.resize(1200, 700)
 
         self.db = DatabaseManager()
         self.monitoring = False
@@ -606,114 +588,26 @@ class PingApp(tk.Tk):
         self.last_stats_refresh = 0
         self.selected_host = None
         self.settings_dialog = None
-        self.add_host_window = None
-        self.edit_host_window = None
-        self.create_group_window = None
+        self.add_host_dialog = None
+        self.edit_host_dialog = None
+        self.create_group_dialog_ref = None
+        self.history_dialog = None
 
         self.load_settings()
-        self.create_widgets()
+        self.build_ui()
         self.load_groups()
         self.update_overall_status()
-        self.after(200, self.process_ui_queue)
+
+        self.ui_timer = QtCore.QTimer(self)
+        self.ui_timer.timeout.connect(self.process_ui_queue)
+        self.ui_timer.start(200)
 
         if not HAS_OPENPYXL:
-            messagebox.showwarning(
+            QtWidgets.QMessageBox.warning(
+                self,
                 "Внимание",
                 "openpyxl не установлен. Импорт/экспорт Excel будет недоступен.",
             )
-
-    def create_widgets(self):
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-        self.tab_monitor = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_monitor, text="Мониторинг")
-
-        self.tab_stats = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_stats, text="Статистика")
-
-        self.create_monitor_widgets(self.tab_monitor)
-        self.create_stats_widgets(self.tab_stats)
-
-        overall_frame = ttk.Frame(self)
-        overall_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=3)
-
-        ttk.Label(overall_frame, text="Общий статус:").pack(side=tk.LEFT, padx=5)
-        self.overall_status_label = ttk.Label(overall_frame, text="●", font=("Arial", 14))
-        self.overall_status_label.pack(side=tk.LEFT, padx=3)
-
-        ttk.Separator(overall_frame, orient=tk.VERTICAL).pack(
-            side=tk.LEFT, fill=tk.Y, padx=5
-        )
-
-        self.status_var = tk.StringVar(value="Готов")
-        status_bar = ttk.Label(self, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
-        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
-
-    def apply_theme(self):
-        self.style.configure("TFrame", background="#0b0f15")
-        self.style.configure("TLabel", background="#0b0f15", foreground="#e5e7eb")
-        self.style.configure(
-            "TButton",
-            padding=6,
-            background="#111827",
-            foreground="#e5e7eb",
-            bordercolor="#374151",
-        )
-        self.style.map(
-            "TButton",
-            background=[("active", "#1f2937"), ("pressed", "#1d4ed8")],
-            foreground=[("active", "#f9fafb")],
-        )
-        self.style.configure("TNotebook", background="#0b0f15")
-        self.style.configure("TNotebook.Tab", padding=[12, 6])
-        self.style.map(
-            "TNotebook.Tab",
-            background=[("selected", "#111827")],
-            foreground=[("selected", "#f9fafb")],
-        )
-        self.style.configure(
-            "Treeview",
-            background="#111827",
-            fieldbackground="#111827",
-            foreground="#e5e7eb",
-            rowheight=26,
-        )
-        self.style.configure(
-            "Treeview.Heading",
-            background="#1f2937",
-            foreground="#f9fafb",
-            font=("Segoe UI", 10, "bold"),
-        )
-        self.style.map("Treeview", background=[("selected", "#1d4ed8")])
-        self.style.configure("TSeparator", background="#1f2937")
-        self.style.configure(
-            "TEntry",
-            fieldbackground="#111827",
-            foreground="#e5e7eb",
-            insertcolor="#f9fafb",
-        )
-        self.style.configure(
-            "TCombobox",
-            fieldbackground="#111827",
-            foreground="#e5e7eb",
-            arrowcolor="#e5e7eb",
-        )
-        self.style.map(
-            "TCombobox",
-            fieldbackground=[("readonly", "#111827")],
-            foreground=[("readonly", "#e5e7eb")],
-        )
-
-    def show_single_window(self, window_ref, create_callback):
-        if window_ref is not None and window_ref.winfo_exists():
-            window_ref.lift()
-            window_ref.focus_force()
-            return window_ref
-        window_ref = create_callback()
-        window_ref.lift()
-        window_ref.focus_force()
-        return window_ref
 
     def load_settings(self):
         self.default_interval_seconds = int(
@@ -728,321 +622,232 @@ class PingApp(tk.Tk):
         self.batch_size = int(self.db.get_setting("ping_batch_size", DEFAULT_BATCH_SIZE))
         self.max_workers = int(self.db.get_setting("max_ping_workers", DEFAULT_MAX_WORKERS))
 
-    def create_monitor_widgets(self, parent):
-        toolbar = ttk.Frame(parent)
-        toolbar.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+    def build_ui(self):
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        layout = QtWidgets.QVBoxLayout(central)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
 
-        ttk.Label(toolbar, text="Группа:").pack(side=tk.LEFT, padx=5)
-        self.group_combo = ttk.Combobox(toolbar, state="readonly", width=20)
-        self.group_combo.pack(side=tk.LEFT, padx=5)
-        self.group_combo.bind("<<ComboboxSelected>>", self.on_group_select)
+        self.tabs = QtWidgets.QTabWidget()
+        layout.addWidget(self.tabs)
 
-        ttk.Button(toolbar, text="Создать", command=self.create_group_dialog).pack(
-            side=tk.LEFT, padx=2
+        self.monitor_tab = QtWidgets.QWidget()
+        self.stats_tab = QtWidgets.QWidget()
+        self.tabs.addTab(self.monitor_tab, "Мониторинг")
+        self.tabs.addTab(self.stats_tab, "Статистика")
+
+        self.build_monitor_tab()
+        self.build_stats_tab()
+
+        status_layout = QtWidgets.QHBoxLayout()
+        layout.addLayout(status_layout)
+        status_layout.addWidget(QtWidgets.QLabel("Общий статус:"))
+        self.overall_status_label = QtWidgets.QLabel("●")
+        status_layout.addWidget(self.overall_status_label)
+        status_layout.addStretch()
+        self.status_label = QtWidgets.QLabel("Готов")
+        status_layout.addWidget(self.status_label)
+
+    def build_monitor_tab(self):
+        layout = QtWidgets.QVBoxLayout(self.monitor_tab)
+        layout.setSpacing(6)
+
+        toolbar = QtWidgets.QHBoxLayout()
+        layout.addLayout(toolbar)
+
+        toolbar.addWidget(QtWidgets.QLabel("Группа:"))
+        self.group_combo = QtWidgets.QComboBox()
+        self.group_combo.currentTextChanged.connect(self.on_group_select)
+        toolbar.addWidget(self.group_combo)
+
+        toolbar.addWidget(self.create_button("Создать", self.show_create_group_dialog))
+        toolbar.addWidget(self.create_button("Удалить", self.delete_group))
+        toolbar.addSpacing(10)
+
+        toolbar.addWidget(self.create_button("Добавить хост", self.show_add_host_dialog))
+        toolbar.addWidget(self.create_button("Редактировать хост", self.show_edit_host_dialog))
+        toolbar.addWidget(self.create_button("Удалить хост", self.remove_host))
+        toolbar.addSpacing(10)
+
+        toolbar.addWidget(self.create_button("Экспорт (Excel)", self.export_data))
+        toolbar.addWidget(self.create_button("Импорт (Excel)", self.import_data))
+        toolbar.addWidget(self.create_button("Настройки", self.show_settings_dialog))
+        toolbar.addSpacing(10)
+
+        toolbar.addWidget(QtWidgets.QLabel("Поиск:"))
+        self.search_input = QtWidgets.QLineEdit()
+        self.search_input.textChanged.connect(self.refresh_table)
+        toolbar.addWidget(self.search_input)
+        toolbar.addWidget(self.create_button("Очистить", self.clear_search))
+        toolbar.addSpacing(10)
+
+        toolbar.addWidget(QtWidgets.QLabel("Фильтр:"))
+        self.filter_combo = QtWidgets.QComboBox()
+        self.filter_combo.addItems([
+            "all",
+            "online",
+            "offline_lt_1h",
+            "offline_ge_1h",
+            "unknown",
+        ])
+        self.filter_combo.currentTextChanged.connect(self.refresh_table)
+        toolbar.addWidget(self.filter_combo)
+        toolbar.addStretch()
+
+        self.btn_start = QtWidgets.QPushButton("Старт")
+        self.btn_start.clicked.connect(self.toggle_monitoring)
+        toolbar.addWidget(self.btn_start)
+
+        content = QtWidgets.QSplitter()
+        content.setStretchFactor(0, 3)
+        content.setStretchFactor(1, 1)
+        layout.addWidget(content)
+
+        self.host_table = QtWidgets.QTableWidget(0, 7)
+        self.host_table.setHorizontalHeaderLabels(
+            [
+                "",
+                "Адрес",
+                "Описание",
+                "Подгруппа",
+                "Интервал (сек)",
+                "Задержка (мс)",
+                "Последняя проверка",
+            ]
         )
-        ttk.Button(toolbar, text="Удалить", command=self.delete_group).pack(side=tk.LEFT, padx=2)
+        self.host_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.host_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.host_table.verticalHeader().setVisible(False)
+        self.host_table.horizontalHeader().setStretchLastSection(True)
+        self.host_table.itemSelectionChanged.connect(self.on_host_select)
+        content.addWidget(self.host_table)
 
-        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+        detail_widget = QtWidgets.QWidget()
+        detail_layout = QtWidgets.QVBoxLayout(detail_widget)
+        detail_layout.setContentsMargins(8, 8, 8, 8)
+        detail_layout.setSpacing(8)
+        content.addWidget(detail_widget)
 
-        ttk.Button(toolbar, text="Добавить хост", command=self.add_host_dialog).pack(
-            side=tk.LEFT, padx=2
-        )
-        ttk.Button(toolbar, text="Редактировать хост", command=self.edit_host_dialog).pack(
-            side=tk.LEFT, padx=2
-        )
-        ttk.Button(toolbar, text="Удалить хост", command=self.remove_host).pack(
-            side=tk.LEFT, padx=2
-        )
-
-        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
-
-        ttk.Button(toolbar, text="Экспорт (Excel)", command=self.export_data).pack(
-            side=tk.LEFT, padx=2
-        )
-        ttk.Button(toolbar, text="Импорт (Excel)", command=self.import_data).pack(
-            side=tk.LEFT, padx=2
-        )
-
-        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
-
-        ttk.Button(toolbar, text="Настройки", command=self.open_settings_dialog).pack(
-            side=tk.LEFT, padx=2
-        )
-
-        ttk.Label(toolbar, text="Поиск:").pack(side=tk.LEFT, padx=5)
-        self.search_var = tk.StringVar()
-        search_entry = ttk.Entry(toolbar, textvariable=self.search_var, width=20)
-        search_entry.pack(side=tk.LEFT, padx=5)
-        search_entry.bind("<KeyRelease>", lambda event: self.refresh_table())
-        ttk.Button(toolbar, text="Очистить", command=self.clear_search).pack(
-            side=tk.LEFT, padx=2
-        )
-
-        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
-
-        ttk.Label(toolbar, text="Фильтр:").pack(side=tk.LEFT, padx=5)
-        self.filter_var = tk.StringVar(value="all")
-        self.filter_combo = ttk.Combobox(
-            toolbar,
-            textvariable=self.filter_var,
-            state="readonly",
-            width=18,
-            values=[
-                "all",
-                "online",
-                "offline_lt_1h",
-                "offline_ge_1h",
-                "unknown",
-            ],
-        )
-        self.filter_combo.pack(side=tk.LEFT, padx=5)
-        self.filter_combo.bind("<<ComboboxSelected>>", lambda event: self.refresh_table())
-
-        self.btn_start = ttk.Button(toolbar, text="Старт", command=self.toggle_monitoring)
-        self.btn_start.pack(side=tk.LEFT, padx=5)
-
-        content = ttk.Frame(parent)
-        content.pack(fill=tk.BOTH, expand=True)
-
-        paned = ttk.Panedwindow(content, orient=tk.HORIZONTAL)
-        paned.pack(fill=tk.BOTH, expand=True)
-
-        table_frame = ttk.Frame(paned)
-        detail_frame = ttk.Frame(paned)
-        paned.add(table_frame, weight=3)
-        paned.add(detail_frame, weight=1)
-
-        columns = (
-            "status_indicator",
-            "address",
-            "description",
-            "subgroup",
-            "ping_interval",
-            "latency",
-            "last_check",
-        )
-        self.tree = ttk.Treeview(
-            table_frame, columns=columns, show="headings", selectmode="extended", height=20
-        )
-
-        self.tree.heading("status_indicator", text="")
-        self.tree.heading("address", text="Адрес")
-        self.tree.heading("description", text="Описание")
-        self.tree.heading("subgroup", text="Подгруппа")
-        self.tree.heading("ping_interval", text="Интервал (сек)")
-        self.tree.heading("latency", text="Задержка (мс)")
-        self.tree.heading("last_check", text="Последняя проверка")
-
-        self.tree.column("status_indicator", width=30)
-        self.tree.column("address", width=140)
-        self.tree.column("description", width=180)
-        self.tree.column("subgroup", width=90)
-        self.tree.column("ping_interval", width=80)
-        self.tree.column("latency", width=80)
-        self.tree.column("last_check", width=130)
-
-        scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
-
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        self.tree.tag_configure("status_green", foreground="#2ecc71")
-        self.tree.tag_configure("status_yellow", foreground="#f39c12")
-        self.tree.tag_configure("status_red", foreground="#e74c3c")
-        self.tree.tag_configure("status_gray", foreground="#95a5a6")
-
-        self.tree.bind("<<TreeviewSelect>>", self.on_host_select)
-
-        ttk.Label(detail_frame, text="Детали хоста", font=("Segoe UI", 12, "bold")).pack(
-            anchor="w", padx=10, pady=(10, 6)
-        )
-
-        info_frame = ttk.Frame(detail_frame)
-        info_frame.pack(fill=tk.X, padx=10)
-
-        self.detail_vars = {
-            "address": tk.StringVar(value="—"),
-            "description": tk.StringVar(value="—"),
-            "subgroup": tk.StringVar(value="—"),
-            "interval": tk.StringVar(value="—"),
-            "status": tk.StringVar(value="—"),
-            "latency": tk.StringVar(value="—"),
-            "last_check": tk.StringVar(value="—"),
-            "status_change": tk.StringVar(value="—"),
-            "min_latency": tk.StringVar(value="—"),
-            "max_latency": tk.StringVar(value="—"),
-            "avg_latency": tk.StringVar(value="—"),
-            "jitter": tk.StringVar(value="—"),
-            "loss": tk.StringVar(value="—"),
-        }
-
-        for label, key in [
-            ("Адрес:", "address"),
-            ("Описание:", "description"),
-            ("Подгруппа:", "subgroup"),
-            ("Интервал:", "interval"),
-            ("Статус:", "status"),
-            ("Задержка:", "latency"),
-            ("Последняя проверка:", "last_check"),
-            ("Последняя смена:", "status_change"),
+        detail_layout.addWidget(self.section_label("Детали хоста"))
+        self.detail_labels = {}
+        for label in [
+            "Адрес",
+            "Описание",
+            "Подгруппа",
+            "Интервал",
+            "Статус",
+            "Задержка",
+            "Последняя проверка",
+            "Последняя смена",
         ]:
-            row = ttk.Frame(info_frame)
-            row.pack(fill=tk.X, pady=2)
-            ttk.Label(row, text=label, width=16, anchor="w").pack(side=tk.LEFT)
-            ttk.Label(row, textvariable=self.detail_vars[key], anchor="w").pack(
-                side=tk.LEFT, fill=tk.X, expand=True
-            )
+            row = QtWidgets.QHBoxLayout()
+            row.addWidget(QtWidgets.QLabel(f"{label}:"))
+            value = QtWidgets.QLabel("—")
+            value.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            row.addWidget(value)
+            row.addStretch()
+            detail_layout.addLayout(row)
+            self.detail_labels[label] = value
 
-        metrics_frame = tk.Frame(detail_frame, bg="#0f172a", padx=8, pady=8)
-        metrics_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
-
-        metric_items = [
-            ("Мин", "min_latency"),
-            ("Макс", "max_latency"),
-            ("Средняя", "avg_latency"),
+        metrics_box = QtWidgets.QGroupBox("Метрики")
+        metrics_layout = QtWidgets.QGridLayout(metrics_box)
+        metrics_layout.setContentsMargins(8, 8, 8, 8)
+        metrics_layout.setHorizontalSpacing(16)
+        metrics_layout.setVerticalSpacing(8)
+        metric_keys = [
+            ("Мин", "min"),
+            ("Макс", "max"),
+            ("Средняя", "avg"),
             ("Джиттер", "jitter"),
             ("Потери", "loss"),
         ]
-        for idx, (label, key) in enumerate(metric_items):
-            card = tk.Frame(metrics_frame, bg="#111827", padx=8, pady=6)
-            card.grid(row=idx // 2, column=idx % 2, padx=6, pady=6, sticky="nsew")
-            metrics_frame.grid_columnconfigure(idx % 2, weight=1)
-            tk.Label(
-                card,
-                text=label,
-                bg="#111827",
-                fg="#9ca3af",
-                font=("Segoe UI", 9),
-            ).pack(anchor="w")
-            tk.Label(
-                card,
-                textvariable=self.detail_vars[key],
-                bg="#111827",
-                fg="#f9fafb",
-                font=("Segoe UI", 11, "bold"),
-            ).pack(anchor="w")
+        self.metric_labels = {}
+        for idx, (title, key) in enumerate(metric_keys):
+            title_label = QtWidgets.QLabel(title)
+            value_label = QtWidgets.QLabel("—")
+            value_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            metrics_layout.addWidget(title_label, idx // 2, (idx % 2) * 2)
+            metrics_layout.addWidget(value_label, idx // 2, (idx % 2) * 2 + 1)
+            self.metric_labels[key] = value_label
+        detail_layout.addWidget(metrics_box)
 
-        history_actions = ttk.Frame(detail_frame)
-        history_actions.pack(fill=tk.X, padx=10, pady=(10, 0))
-        ttk.Button(history_actions, text="История хоста", command=self.open_history_dialog).pack(
-            side=tk.LEFT
+        history_button = QtWidgets.QPushButton("История хоста")
+        history_button.clicked.connect(self.show_history_dialog)
+        detail_layout.addWidget(history_button)
+
+        detail_layout.addWidget(self.section_label("График задержек"))
+        self.chart = QChart()
+        self.chart.setBackgroundVisible(False)
+        self.chart.setLegendVisible(False)
+        self.chart_view = QChartView(self.chart)
+        self.chart_view.setRenderHint(QPainter.Antialiasing)
+        detail_layout.addWidget(self.chart_view, 1)
+
+    def build_stats_tab(self):
+        layout = QtWidgets.QVBoxLayout(self.stats_tab)
+        toolbar = QtWidgets.QHBoxLayout()
+        layout.addLayout(toolbar)
+        refresh_button = QtWidgets.QPushButton("Обновить статистику")
+        refresh_button.clicked.connect(self.refresh_stats)
+        toolbar.addWidget(refresh_button)
+        toolbar.addStretch()
+
+        self.stats_table = QtWidgets.QTableWidget(0, 7)
+        self.stats_table.setHorizontalHeaderLabels(
+            ["Мониторинг", "", "Группа", "Всего", "Доступно", "Недоступно", "Неизвестно"]
         )
+        self.stats_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.stats_table.verticalHeader().setVisible(False)
+        self.stats_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.stats_table)
 
-        ttk.Label(detail_frame, text="График задержек", font=("Segoe UI", 11, "bold")).pack(
-            anchor="w", padx=10, pady=(16, 6)
-        )
-        self.chart_canvas = tk.Canvas(
-            detail_frame,
-            height=220,
-            background="#0b0f15",
-            highlightthickness=1,
-            highlightbackground="#1f2937",
-        )
-        self.chart_canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
-        self.chart_canvas.bind("<Configure>", lambda event: self.update_chart())
+    def create_button(self, text, callback):
+        button = QtWidgets.QPushButton(text)
+        button.clicked.connect(callback)
+        return button
 
-    def create_stats_widgets(self, parent):
-        toolbar = ttk.Frame(parent)
-        toolbar.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
-
-        ttk.Button(toolbar, text="Обновить статистику", command=self.refresh_stats).pack(
-            side=tk.LEFT, padx=5
-        )
-
-        columns = ("active", "status", "group", "total", "online", "offline", "unknown")
-        self.stats_tree = ttk.Treeview(
-            parent, columns=columns, show="headings", selectmode="browse"
-        )
-
-        self.stats_tree.heading("active", text="Мониторинг")
-        self.stats_tree.heading("status", text="")
-        self.stats_tree.heading("group", text="Группа")
-        self.stats_tree.heading("total", text="Всего хостов")
-        self.stats_tree.heading("online", text="Доступно")
-        self.stats_tree.heading("offline", text="Недоступно")
-        self.stats_tree.heading("unknown", text="Неизвестно")
-
-        self.stats_tree.column("active", width=95, anchor="center")
-        self.stats_tree.column("status", width=25)
-        self.stats_tree.column("group", width=150)
-        self.stats_tree.column("total", width=100)
-        self.stats_tree.column("online", width=80)
-        self.stats_tree.column("offline", width=80)
-        self.stats_tree.column("unknown", width=80)
-
-        self.stats_tree.tag_configure("status_healthy", foreground="#2ecc71")
-        self.stats_tree.tag_configure("status_warning", foreground="#f39c12")
-        self.stats_tree.tag_configure("status_critical", foreground="#e74c3c")
-
-        self.stats_tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.stats_tree.bind("<Button-1>", self.toggle_group_active)
-
-        self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_change)
-
-    def on_tab_change(self, event):
-        selected_tab = self.notebook.select()
-        tab_text = self.notebook.tab(selected_tab, "text")
-        if tab_text == "Статистика":
-            self.refresh_stats()
-
-    def refresh_stats(self):
-        for item in self.stats_tree.get_children():
-            self.stats_tree.delete(item)
-
-        active_map = self.db.get_groups_with_status()
-        stats = self.db.get_all_hosts_stats()
-        for s in stats:
-            tag = f"status_{s['status']}"
-            self.stats_tree.insert(
-                "",
-                "end",
-                values=(
-                    "☑" if active_map.get(s["group"], False) else "☐",
-                    "●",
-                    s["group"],
-                    s["total"],
-                    s["online"],
-                    s["offline"],
-                    s["unknown"],
-                ),
-                tags=(tag,),
-            )
-
-        self.update_overall_status()
-
-    def toggle_group_active(self, event):
-        region = self.stats_tree.identify("region", event.x, event.y)
-        column = self.stats_tree.identify_column(event.x)
-        if region != "cell" or column != "#1":
-            return
-        item_id = self.stats_tree.identify_row(event.y)
-        if not item_id:
-            return
-        values = self.stats_tree.item(item_id)["values"]
-        if not values or len(values) < 3:
-            return
-        group = values[2]
-        active_map = self.db.get_groups_with_status()
-        current = active_map.get(group, False)
-        self.db.set_group_active(group, not current)
-        self.refresh_stats()
-
-    def update_overall_status(self):
-        overall = self.db.get_overall_status()
-        color_map = {
-            "healthy": "#2ecc71",
-            "warning": "#f39c12",
-            "critical": "#e74c3c",
-        }
-        self.overall_status_label.config(foreground=color_map.get(overall, "#95a5a6"))
+    def section_label(self, text):
+        label = QtWidgets.QLabel(text)
+        font = label.font()
+        font.setBold(True)
+        label.setFont(font)
+        return label
 
     def clear_search(self):
-        self.search_var.set("")
+        self.search_input.clear()
         self.refresh_table()
 
+    def load_groups(self):
+        groups = self.db.get_groups()
+        self.group_combo.clear()
+        self.group_combo.addItems(groups)
+        if groups:
+            self.current_group = groups[0]
+            self.group_combo.setCurrentText(self.current_group)
+        else:
+            self.current_group = None
+            self.clear_table()
+        self.refresh_stats()
+
+    def on_group_select(self, group_name):
+        self.current_group = group_name
+        self.selected_host = None
+        self.reset_detail_panel()
+        self.refresh_table()
+
+    def reset_detail_panel(self):
+        for label in self.detail_labels.values():
+            label.setText("—")
+        for label in self.metric_labels.values():
+            label.setText("—")
+        self.clear_chart()
+
+    def clear_table(self):
+        self.host_table.setRowCount(0)
+
     def match_filter(self, status, offline_since):
-        filter_value = self.filter_var.get()
+        filter_value = self.filter_combo.currentText()
         if filter_value == "all":
             return True
         if filter_value == "unknown":
@@ -1065,414 +870,17 @@ class PingApp(tk.Tk):
                 return diff >= 3600
         return True
 
-    def load_groups(self):
-        groups = self.db.get_groups()
-        self.group_combo["values"] = groups
-        if groups:
-            if self.current_group and self.current_group in groups:
-                self.group_combo.set(self.current_group)
-            else:
-                self.group_combo.current(0)
-                self.on_group_select(None)
-        else:
-            self.group_combo.set("")
-            self.clear_table()
-
-    def on_group_select(self, event):
-        self.current_group = self.group_combo.get()
-        self.selected_host = None
-        self.reset_detail_panel()
-        self.refresh_table()
-
-    def create_group_dialog(self):
-        def build_window():
-            dialog = tk.Toplevel(self)
-            dialog.title("Новая группа")
-            dialog.geometry("300x160")
-            ttk.Label(dialog, text="Имя группы:").pack(pady=10)
-            name_var = tk.StringVar()
-            entry = ttk.Entry(dialog, textvariable=name_var, width=25)
-            entry.pack(pady=5)
-            entry.focus_set()
-
-            def save():
-                name = name_var.get()
-                if name:
-                    try:
-                        self.db.create_group(name)
-                        self.load_groups()
-                        self.group_combo.set(name)
-                        self.on_group_select(None)
-                        dialog.destroy()
-                    except ValueError as e:
-                        messagebox.showerror("Ошибка", str(e))
-
-            ttk.Button(dialog, text="Создать", command=save).pack(pady=10)
-            dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
-            return dialog
-
-        self.create_group_window = self.show_single_window(
-            self.create_group_window, build_window
-        )
-
-    def delete_group(self):
-        if not self.current_group:
-            return
-        if messagebox.askyesno("Подтверждение", f"Удалить группу '{self.current_group}'?"):
-            self.db.delete_group(self.current_group)
-            self.current_group = None
-            self.load_groups()
-
-    def add_host_dialog(self):
-        if not self.current_group:
-            messagebox.showwarning("Внимание", "Сначала создайте или выберите группу.")
-            return
-        def build_window():
-            dialog = tk.Toplevel(self)
-            dialog.title("Добавить хост")
-            dialog.geometry("350x340")
-
-            ttk.Label(dialog, text="Адрес (IP/Домен):").pack(pady=5)
-            addr_entry = ttk.Entry(dialog, width=30)
-            addr_entry.pack(pady=5)
-
-            ttk.Label(dialog, text="Описание:").pack(pady=5)
-            desc_entry = ttk.Entry(dialog, width=30)
-            desc_entry.pack(pady=5)
-
-            ttk.Label(dialog, text="Подгруппа (необязательно):").pack(pady=5)
-            sub_entry = ttk.Entry(dialog, width=30)
-            sub_entry.pack(pady=5)
-
-            ttk.Label(dialog, text="Интервал пинга (секунды):").pack(pady=5)
-            interval_var = tk.StringVar(value=str(self.default_interval_seconds))
-            interval_entry = ttk.Entry(dialog, width=30, textvariable=interval_var)
-            interval_entry.pack(pady=5)
-
-            def save():
-                try:
-                    interval_seconds = int(interval_var.get())
-                    if interval_seconds <= 0:
-                        raise ValueError("Интервал должен быть больше 0 секунд.")
-                    self.db.add_host(
-                        self.current_group,
-                        addr_entry.get(),
-                        desc_entry.get(),
-                        sub_entry.get() or None,
-                        interval_seconds,
-                    )
-                    self.refresh_table()
-                    dialog.destroy()
-                except ValueError as e:
-                    messagebox.showerror("Ошибка", str(e))
-                except sqlite3.Error as e:
-                    messagebox.showerror("Ошибка БД", str(e))
-
-            ttk.Button(dialog, text="Сохранить", command=save).pack(pady=10)
-            dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
-            return dialog
-
-        self.add_host_window = self.show_single_window(self.add_host_window, build_window)
-
-    def edit_host_dialog(self):
-        if not self.current_group:
-            messagebox.showwarning("Внимание", "Выберите группу.")
-            return
-
-        selected_item = self.tree.selection()
-        if len(selected_item) != 1:
-            messagebox.showwarning("Внимание", "Выберите один хост для редактирования.")
-            return
-
-        item = self.tree.item(selected_item[0])
-        address = item["values"][1]
-        hosts = self.db.get_hosts(self.current_group)
-        host_map = {h[0]: h for h in hosts}
-        host_data = host_map.get(address)
-        if not host_data:
-            return
-
-        def build_window():
-            dialog = tk.Toplevel(self)
-            dialog.title("Редактировать хост")
-            dialog.geometry("350x340")
-
-            ttk.Label(dialog, text="Адрес (IP/Домен):").pack(pady=5)
-            addr_entry = ttk.Entry(dialog, width=30)
-            addr_entry.insert(0, host_data[0])
-            addr_entry.configure(state="disabled")
-            addr_entry.pack(pady=5)
-
-            ttk.Label(dialog, text="Описание:").pack(pady=5)
-            desc_entry = ttk.Entry(dialog, width=30)
-            desc_entry.insert(0, host_data[1] or "")
-            desc_entry.pack(pady=5)
-
-            ttk.Label(dialog, text="Подгруппа (необязательно):").pack(pady=5)
-            sub_entry = ttk.Entry(dialog, width=30)
-            sub_entry.insert(0, host_data[2] or "")
-            sub_entry.pack(pady=5)
-
-            ttk.Label(dialog, text="Интервал пинга (секунды):").pack(pady=5)
-            interval_seconds = host_data[3] if host_data[3] else self.default_interval_seconds
-            interval_var = tk.StringVar(value=str(interval_seconds))
-            interval_entry = ttk.Entry(dialog, width=30, textvariable=interval_var)
-            interval_entry.pack(pady=5)
-
-            def save():
-                try:
-                    interval_seconds = int(interval_var.get())
-                    if interval_seconds <= 0:
-                        raise ValueError("Интервал должен быть больше 0 секунд.")
-                    self.db.update_host(
-                        self.current_group,
-                        host_data[0],
-                        desc_entry.get(),
-                        sub_entry.get() or None,
-                        interval_seconds,
-                    )
-                    self.refresh_table()
-                    dialog.destroy()
-                except ValueError as e:
-                    messagebox.showerror("Ошибка", str(e))
-                except sqlite3.Error as e:
-                    messagebox.showerror("Ошибка БД", str(e))
-
-            ttk.Button(dialog, text="Сохранить", command=save).pack(pady=10)
-            dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
-            return dialog
-
-        self.edit_host_window = self.show_single_window(
-            self.edit_host_window, build_window
-        )
-
-    def remove_host(self):
-        selected_item = self.tree.selection()
-        if not selected_item:
-            return
-
-        for item_id in selected_item:
-            item = self.tree.item(item_id)
-            address = item["values"][1]
-            self.db.remove_host(self.current_group, address)
-
-        self.refresh_table()
-
-    def export_data(self):
-        if not self.current_group:
-            return
-
-        if not HAS_OPENPYXL:
-            messagebox.showerror("Ошибка", "openpyxl не установлен. Невозможно экспортировать.")
-            return
-
-        filename = filedialog.asksaveasfilename(
-            defaultextension=".xlsx", filetypes=[("Excel Files", "*.xlsx")]
-        )
-
-        if filename:
-            try:
-                wb = Workbook()
-                ws = wb.active
-                ws.title = "hosts"
-
-                ws.append(["address", "description", "subgroup", "ping_interval_sec"])
-                hosts = self.db.get_hosts(self.current_group)
-                for h in hosts:
-                    interval_sec = h[3] if h[3] else self.default_interval_seconds
-                    ws.append([h[0], h[1], h[2] or "", interval_sec])
-
-                for col in ws.columns:
-                    max_length = 0
-                    for cell in col:
-                        cell_value = str(cell.value) if cell.value is not None else ""
-                        if len(cell_value) > max_length:
-                            max_length = len(cell_value)
-                    adjusted_width = min(max_length + 2, 50)
-                    ws.column_dimensions[get_column_letter(col[0].column)].width = adjusted_width
-
-                wb.save(filename)
-                messagebox.showinfo("Успех", "Данные экспортированы в Excel.")
-            except Exception as e:
-                messagebox.showerror("Ошибка", str(e))
-
-    def import_data(self):
-        if not self.current_group:
-            messagebox.showwarning("Внимание", "Выберите группу.")
-            return
-
-        if not HAS_OPENPYXL:
-            messagebox.showerror("Ошибка", "openpyxl не установлен. Невозможно импортировать.")
-            return
-
-        filename = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsx")])
-
-        if filename:
-            try:
-                wb = load_workbook(filename)
-                ws = wb.active
-
-                rows = list(ws.iter_rows(values_only=True))
-                if not rows:
-                    return
-
-                headers = [str(cell).strip().lower() if cell else "" for cell in rows[0]]
-                interval_is_minutes = "ping_interval_min" in headers
-                for row in rows[1:]:
-                    if row and len(row) >= 2:
-                        addr = row[0]
-                        desc = row[1]
-                        sub = row[2] if len(row) > 2 else None
-                        interval_value = (
-                            int(row[3]) if len(row) > 3 and row[3] else self.default_interval_seconds
-                        )
-                        interval_sec = interval_value * 60 if interval_is_minutes else interval_value
-                        if addr:
-                            self.db.add_host(self.current_group, addr, desc, sub, interval_sec)
-
-                self.refresh_table()
-                messagebox.showinfo("Успех", "Данные импортированы из Excel.")
-            except Exception as e:
-                messagebox.showerror("Ошибка", str(e))
-
-    def open_settings_dialog(self):
-        def build_window():
-            dialog = tk.Toplevel(self)
-            dialog.title("Настройки")
-            dialog.geometry("360x320")
-
-            fields = [
-                ("Интервал по умолчанию (сек)", "default_interval_seconds", self.default_interval_seconds),
-                ("Интервал цикла мониторинга (сек)", "monitor_interval_seconds", self.monitor_interval),
-                ("Таймаут пинга (сек)", "ping_timeout_seconds", self.ping_timeout),
-                ("Размер пачки пингов", "ping_batch_size", self.batch_size),
-                ("Макс. потоков пинга", "max_ping_workers", self.max_workers),
-            ]
-
-            entries = {}
-            for label, key, value in fields:
-                row = ttk.Frame(dialog)
-                row.pack(fill=tk.X, padx=10, pady=6)
-                ttk.Label(row, text=label).pack(side=tk.LEFT)
-                entry = ttk.Entry(row, width=10)
-                entry.insert(0, str(value))
-                entry.pack(side=tk.RIGHT)
-                entries[key] = entry
-
-            def save():
-                try:
-                    default_interval = int(entries["default_interval_seconds"].get())
-                    monitor_interval = float(entries["monitor_interval_seconds"].get())
-                    ping_timeout = float(entries["ping_timeout_seconds"].get())
-                    batch_size = int(entries["ping_batch_size"].get())
-                    max_workers = int(entries["max_ping_workers"].get())
-
-                    if default_interval <= 0 or monitor_interval <= 0 or ping_timeout <= 0:
-                        raise ValueError("Интервалы и таймаут должны быть больше 0.")
-                    if batch_size <= 0 or max_workers <= 0:
-                        raise ValueError("Размеры должны быть больше 0.")
-
-                    self.db.set_setting("default_interval_seconds", default_interval)
-                    self.db.set_setting("monitor_interval_seconds", monitor_interval)
-                    self.db.set_setting("ping_timeout_seconds", ping_timeout)
-                    self.db.set_setting("ping_batch_size", batch_size)
-                    self.db.set_setting("max_ping_workers", max_workers)
-
-                    self.load_settings()
-                    dialog.destroy()
-                except ValueError as e:
-                    messagebox.showerror("Ошибка", str(e))
-
-            ttk.Button(dialog, text="Сохранить", command=save).pack(pady=10)
-            dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
-            return dialog
-
-        self.settings_dialog = self.show_single_window(self.settings_dialog, build_window)
-
-    def open_history_dialog(self):
-        if not self.selected_host:
-            messagebox.showwarning("Внимание", "Выберите хост.")
-            return
-        group, address = self.selected_host
-        dialog = tk.Toplevel(self)
-        dialog.title(f"История хоста {address}")
-        dialog.geometry("700x500")
-
-        ttk.Label(dialog, text=f"Группа: {group}", font=("Segoe UI", 10, "bold")).pack(
-            anchor="w", padx=10, pady=(10, 5)
-        )
-
-        change_frame = ttk.LabelFrame(dialog, text="Смена статуса")
-        change_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
-        change_tree = ttk.Treeview(
-            change_frame, columns=("timestamp", "status"), show="headings", height=4
-        )
-        change_tree.heading("timestamp", text="Время")
-        change_tree.heading("status", text="Статус")
-        change_tree.column("timestamp", width=180)
-        change_tree.column("status", width=120)
-        change_tree.pack(fill=tk.X, padx=5, pady=5)
-
-        history_frame = ttk.LabelFrame(dialog, text="Полная история")
-        history_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
-        history_tree = ttk.Treeview(
-            history_frame,
-            columns=("timestamp", "status", "latency"),
-            show="headings",
-        )
-        history_tree.heading("timestamp", text="Время")
-        history_tree.heading("status", text="Статус")
-        history_tree.heading("latency", text="Задержка (мс)")
-        history_tree.column("timestamp", width=180)
-        history_tree.column("status", width=120)
-        history_tree.column("latency", width=120)
-
-        scrollbar = ttk.Scrollbar(history_frame, orient=tk.VERTICAL, command=history_tree.yview)
-        history_tree.configure(yscrollcommand=scrollbar.set)
-        history_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        results = self.db.get_recent_results(group, address, limit=200)
-        last_status = None
-        for timestamp, status, latency in results:
-            latency_ms = f"{latency * 1000:.0f}" if latency else "-"
-            history_tree.insert("", "end", values=(timestamp, status, latency_ms))
-            if status != last_status:
-                change_tree.insert("", "end", values=(timestamp, status))
-                last_status = status
-
-    def get_status_color(self, address):
-        if address not in self.host_status_cache:
-            return "gray"
-
-        status, offline_since = self.host_status_cache[address]
-
-        if status == "Online":
-            return "green"
-        if status == "Offline":
-            if offline_since:
-                try:
-                    offline_time = datetime.strptime(offline_since, "%Y-%m-%d %H:%M:%S")
-                    diff = (datetime.now() - offline_time).total_seconds()
-                    if diff < 3600:
-                        return "yellow"
-                    return "red"
-                except ValueError:
-                    return "red"
-            return "red"
-        return "gray"
-
     def refresh_table(self):
-        self.clear_table()
+        self.host_table.setRowCount(0)
         if not self.current_group:
             return
 
-        search_text = self.search_var.get().strip().lower()
-
+        search_text = self.search_input.text().strip().lower()
         hosts = self.db.get_hosts(self.current_group)
+        self.host_row_map = {}
+
         for host in hosts:
             address, desc, subgroup, interval_sec, last_ping_time, offline_since = host
-
             if search_text:
                 haystack = " ".join(
                     [str(address), str(desc or ""), str(subgroup or "")]
@@ -1487,43 +895,384 @@ class PingApp(tk.Tk):
             self.host_status_cache[address] = (status, offline_since)
 
             interval_value = interval_sec if interval_sec else self.default_interval_seconds
-            color_name = self.get_status_color(address)
-            tag = f"status_{color_name}"
             recent = self.db.get_recent_results(self.current_group, address, limit=1)
             last_latency = recent[-1][2] if recent else None
             latency_ms = f"{last_latency * 1000:.0f}" if last_latency else "-"
             last_check_display = last_ping_time or "-"
 
-            self.tree.insert(
-                "",
-                "end",
-                values=(
-                    "●",
-                    address,
-                    desc,
-                    subgroup or "",
-                    interval_value,
-                    latency_ms,
-                    last_check_display,
-                ),
-                tags=(tag,),
+            row = self.host_table.rowCount()
+            self.host_table.insertRow(row)
+            self.host_table.setItem(row, 0, QtWidgets.QTableWidgetItem("●"))
+            self.host_table.setItem(row, 1, QtWidgets.QTableWidgetItem(address))
+            self.host_table.setItem(row, 2, QtWidgets.QTableWidgetItem(desc or ""))
+            self.host_table.setItem(row, 3, QtWidgets.QTableWidgetItem(subgroup or ""))
+            self.host_table.setItem(row, 4, QtWidgets.QTableWidgetItem(str(interval_value)))
+            self.host_table.setItem(row, 5, QtWidgets.QTableWidgetItem(latency_ms))
+            self.host_table.setItem(row, 6, QtWidgets.QTableWidgetItem(last_check_display))
+            self.host_row_map[address] = row
+
+    def refresh_stats(self):
+        self.stats_table.setRowCount(0)
+        active_map = self.db.get_groups_with_status()
+        stats = self.db.get_all_hosts_stats()
+
+        for entry in stats:
+            row = self.stats_table.rowCount()
+            self.stats_table.insertRow(row)
+
+            checkbox = QtWidgets.QCheckBox()
+            checkbox.setChecked(active_map.get(entry["group"], False))
+            checkbox.stateChanged.connect(
+                lambda state, group=entry["group"]: self.db.set_group_active(group, state == QtCore.Qt.Checked)
             )
+            checkbox.stateChanged.connect(lambda _: self.refresh_stats())
+            self.stats_table.setCellWidget(row, 0, checkbox)
+            self.stats_table.setItem(row, 1, QtWidgets.QTableWidgetItem("●"))
+            self.stats_table.setItem(row, 2, QtWidgets.QTableWidgetItem(entry["group"]))
+            self.stats_table.setItem(row, 3, QtWidgets.QTableWidgetItem(str(entry["total"])))
+            self.stats_table.setItem(row, 4, QtWidgets.QTableWidgetItem(str(entry["online"])))
+            self.stats_table.setItem(row, 5, QtWidgets.QTableWidgetItem(str(entry["offline"])))
+            self.stats_table.setItem(row, 6, QtWidgets.QTableWidgetItem(str(entry["unknown"])))
 
-    def clear_table(self):
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+    def update_overall_status(self):
+        overall = self.db.get_overall_status()
+        color_map = {
+            "healthy": "#2ecc71",
+            "warning": "#f39c12",
+            "critical": "#e74c3c",
+        }
+        self.overall_status_label.setStyleSheet(
+            f"color: {color_map.get(overall, '#95a5a6')};"
+        )
 
-    def reset_detail_panel(self):
-        for key in self.detail_vars:
-            self.detail_vars[key].set("—")
-        self.chart_canvas.delete("all")
+    def show_single_dialog(self, current_dialog, builder):
+        if current_dialog is not None and current_dialog.isVisible():
+            current_dialog.raise_()
+            current_dialog.activateWindow()
+            return current_dialog
+        dialog = builder()
+        dialog.show()
+        return dialog
 
-    def on_host_select(self, event):
-        selection = self.tree.selection()
-        if not selection:
+    def show_create_group_dialog(self):
+        def build():
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("Новая группа")
+            dialog.setFixedSize(300, 160)
+            layout = QtWidgets.QVBoxLayout(dialog)
+            layout.addWidget(QtWidgets.QLabel("Имя группы:"))
+            name_input = QtWidgets.QLineEdit()
+            layout.addWidget(name_input)
+            button = QtWidgets.QPushButton("Создать")
+            layout.addWidget(button)
+
+            def save():
+                name = name_input.text().strip()
+                if not name:
+                    return
+                try:
+                    self.db.create_group(name)
+                    self.load_groups()
+                    self.group_combo.setCurrentText(name)
+                    dialog.accept()
+                except ValueError as exc:
+                    QtWidgets.QMessageBox.warning(dialog, "Ошибка", str(exc))
+
+            button.clicked.connect(save)
+            return dialog
+
+        self.create_group_dialog_ref = self.show_single_dialog(
+            self.create_group_dialog_ref, build
+        )
+
+    def show_add_host_dialog(self):
+        if not self.current_group:
+            QtWidgets.QMessageBox.warning(self, "Внимание", "Выберите группу.")
             return
-        item = self.tree.item(selection[0])
-        address = item["values"][1]
+
+        def build():
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("Добавить хост")
+            dialog.setFixedSize(350, 340)
+            layout = QtWidgets.QFormLayout(dialog)
+            addr_input = QtWidgets.QLineEdit()
+            desc_input = QtWidgets.QLineEdit()
+            sub_input = QtWidgets.QLineEdit()
+            interval_input = QtWidgets.QLineEdit(str(self.default_interval_seconds))
+            layout.addRow("Адрес (IP/Домен):", addr_input)
+            layout.addRow("Описание:", desc_input)
+            layout.addRow("Подгруппа:", sub_input)
+            layout.addRow("Интервал пинга (секунды):", interval_input)
+            save_button = QtWidgets.QPushButton("Сохранить")
+            layout.addRow(save_button)
+
+            def save():
+                try:
+                    interval_seconds = int(interval_input.text())
+                    if interval_seconds <= 0:
+                        raise ValueError("Интервал должен быть больше 0 секунд.")
+                    self.db.add_host(
+                        self.current_group,
+                        addr_input.text(),
+                        desc_input.text(),
+                        sub_input.text() or None,
+                        interval_seconds,
+                    )
+                    self.refresh_table()
+                    dialog.accept()
+                except ValueError as exc:
+                    QtWidgets.QMessageBox.warning(dialog, "Ошибка", str(exc))
+                except sqlite3.Error as exc:
+                    QtWidgets.QMessageBox.warning(dialog, "Ошибка БД", str(exc))
+
+            save_button.clicked.connect(save)
+            return dialog
+
+        self.add_host_dialog = self.show_single_dialog(self.add_host_dialog, build)
+
+    def show_edit_host_dialog(self):
+        if not self.current_group:
+            QtWidgets.QMessageBox.warning(self, "Внимание", "Выберите группу.")
+            return
+
+        selected_items = self.host_table.selectedItems()
+        if not selected_items:
+            QtWidgets.QMessageBox.warning(self, "Внимание", "Выберите хост.")
+            return
+        address = selected_items[1].text()
+        hosts = self.db.get_hosts(self.current_group)
+        host_map = {h[0]: h for h in hosts}
+        host_data = host_map.get(address)
+        if not host_data:
+            return
+
+        def build():
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("Редактировать хост")
+            dialog.setFixedSize(350, 340)
+            layout = QtWidgets.QFormLayout(dialog)
+            addr_input = QtWidgets.QLineEdit(host_data[0])
+            addr_input.setEnabled(False)
+            desc_input = QtWidgets.QLineEdit(host_data[1] or "")
+            sub_input = QtWidgets.QLineEdit(host_data[2] or "")
+            interval_seconds = host_data[3] if host_data[3] else self.default_interval_seconds
+            interval_input = QtWidgets.QLineEdit(str(interval_seconds))
+            layout.addRow("Адрес (IP/Домен):", addr_input)
+            layout.addRow("Описание:", desc_input)
+            layout.addRow("Подгруппа:", sub_input)
+            layout.addRow("Интервал пинга (секунды):", interval_input)
+            save_button = QtWidgets.QPushButton("Сохранить")
+            layout.addRow(save_button)
+
+            def save():
+                try:
+                    interval_value = int(interval_input.text())
+                    if interval_value <= 0:
+                        raise ValueError("Интервал должен быть больше 0 секунд.")
+                    self.db.update_host(
+                        self.current_group,
+                        host_data[0],
+                        desc_input.text(),
+                        sub_input.text() or None,
+                        interval_value,
+                    )
+                    self.refresh_table()
+                    dialog.accept()
+                except ValueError as exc:
+                    QtWidgets.QMessageBox.warning(dialog, "Ошибка", str(exc))
+                except sqlite3.Error as exc:
+                    QtWidgets.QMessageBox.warning(dialog, "Ошибка БД", str(exc))
+
+            save_button.clicked.connect(save)
+            return dialog
+
+        self.edit_host_dialog = self.show_single_dialog(self.edit_host_dialog, build)
+
+    def show_settings_dialog(self):
+        def build():
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("Настройки")
+            dialog.setFixedSize(360, 320)
+            layout = QtWidgets.QFormLayout(dialog)
+            default_interval_input = QtWidgets.QLineEdit(str(self.default_interval_seconds))
+            monitor_interval_input = QtWidgets.QLineEdit(str(self.monitor_interval))
+            ping_timeout_input = QtWidgets.QLineEdit(str(self.ping_timeout))
+            batch_size_input = QtWidgets.QLineEdit(str(self.batch_size))
+            max_workers_input = QtWidgets.QLineEdit(str(self.max_workers))
+            layout.addRow("Интервал по умолчанию (сек)", default_interval_input)
+            layout.addRow("Интервал цикла мониторинга (сек)", monitor_interval_input)
+            layout.addRow("Таймаут пинга (сек)", ping_timeout_input)
+            layout.addRow("Размер пачки пингов", batch_size_input)
+            layout.addRow("Макс. потоков пинга", max_workers_input)
+            save_button = QtWidgets.QPushButton("Сохранить")
+            layout.addRow(save_button)
+
+            def save():
+                try:
+                    default_interval = int(default_interval_input.text())
+                    monitor_interval = float(monitor_interval_input.text())
+                    ping_timeout = float(ping_timeout_input.text())
+                    batch_size = int(batch_size_input.text())
+                    max_workers = int(max_workers_input.text())
+
+                    if default_interval <= 0 or monitor_interval <= 0 or ping_timeout <= 0:
+                        raise ValueError("Интервалы и таймаут должны быть больше 0.")
+                    if batch_size <= 0 or max_workers <= 0:
+                        raise ValueError("Размеры должны быть больше 0.")
+
+                    self.db.set_setting("default_interval_seconds", default_interval)
+                    self.db.set_setting("monitor_interval_seconds", monitor_interval)
+                    self.db.set_setting("ping_timeout_seconds", ping_timeout)
+                    self.db.set_setting("ping_batch_size", batch_size)
+                    self.db.set_setting("max_ping_workers", max_workers)
+
+                    self.load_settings()
+                    dialog.accept()
+                except ValueError as exc:
+                    QtWidgets.QMessageBox.warning(dialog, "Ошибка", str(exc))
+
+            save_button.clicked.connect(save)
+            return dialog
+
+        self.settings_dialog = self.show_single_dialog(self.settings_dialog, build)
+
+    def show_history_dialog(self):
+        if not self.selected_host:
+            QtWidgets.QMessageBox.warning(self, "Внимание", "Выберите хост.")
+            return
+
+        group, address = self.selected_host
+
+        def build():
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle(f"История хоста {address}")
+            dialog.resize(700, 500)
+            layout = QtWidgets.QVBoxLayout(dialog)
+            layout.addWidget(QtWidgets.QLabel(f"Группа: {group}"))
+
+            change_box = QtWidgets.QGroupBox("Смена статуса")
+            change_layout = QtWidgets.QVBoxLayout(change_box)
+            change_table = QtWidgets.QTableWidget(0, 2)
+            change_table.setHorizontalHeaderLabels(["Время", "Статус"])
+            change_table.verticalHeader().setVisible(False)
+            change_table.horizontalHeader().setStretchLastSection(True)
+            change_layout.addWidget(change_table)
+            layout.addWidget(change_box)
+
+            history_box = QtWidgets.QGroupBox("Полная история")
+            history_layout = QtWidgets.QVBoxLayout(history_box)
+            history_table = QtWidgets.QTableWidget(0, 3)
+            history_table.setHorizontalHeaderLabels(["Время", "Статус", "Задержка (мс)"])
+            history_table.verticalHeader().setVisible(False)
+            history_table.horizontalHeader().setStretchLastSection(True)
+            history_layout.addWidget(history_table)
+            layout.addWidget(history_box)
+
+            results = self.db.get_recent_results(group, address, limit=200)
+            last_status = None
+            for timestamp, status, latency in results:
+                latency_ms = f"{latency * 1000:.0f}" if latency else "-"
+                row = history_table.rowCount()
+                history_table.insertRow(row)
+                history_table.setItem(row, 0, QtWidgets.QTableWidgetItem(timestamp))
+                history_table.setItem(row, 1, QtWidgets.QTableWidgetItem(status))
+                history_table.setItem(row, 2, QtWidgets.QTableWidgetItem(latency_ms))
+
+                if status != last_status:
+                    change_row = change_table.rowCount()
+                    change_table.insertRow(change_row)
+                    change_table.setItem(change_row, 0, QtWidgets.QTableWidgetItem(timestamp))
+                    change_table.setItem(change_row, 1, QtWidgets.QTableWidgetItem(status))
+                    last_status = status
+
+            return dialog
+
+        self.history_dialog = self.show_single_dialog(self.history_dialog, build)
+
+    def delete_group(self):
+        if not self.current_group:
+            return
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Подтверждение",
+            f"Удалить группу '{self.current_group}'?",
+        )
+        if reply == QtWidgets.QMessageBox.Yes:
+            self.db.delete_group(self.current_group)
+            self.current_group = None
+            self.load_groups()
+
+    def remove_host(self):
+        selected_items = self.host_table.selectedItems()
+        if not selected_items:
+            return
+        address = selected_items[1].text()
+        self.db.remove_host(self.current_group, address)
+        self.refresh_table()
+
+    def export_data(self):
+        if not self.current_group:
+            return
+        if not HAS_OPENPYXL:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "openpyxl не установлен.")
+            return
+        filename, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Экспорт", "", "Excel Files (*.xlsx)"
+        )
+        if filename:
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "hosts"
+            ws.append(["address", "description", "subgroup", "ping_interval_sec"])
+            hosts = self.db.get_hosts(self.current_group)
+            for h in hosts:
+                interval_sec = h[3] if h[3] else self.default_interval_seconds
+                ws.append([h[0], h[1], h[2] or "", interval_sec])
+            for col in ws.columns:
+                max_length = 0
+                for cell in col:
+                    cell_value = str(cell.value) if cell.value is not None else ""
+                    max_length = max(max_length, len(cell_value))
+                adjusted_width = min(max_length + 2, 50)
+                ws.column_dimensions[get_column_letter(col[0].column)].width = adjusted_width
+            wb.save(filename)
+
+    def import_data(self):
+        if not self.current_group:
+            QtWidgets.QMessageBox.warning(self, "Внимание", "Выберите группу.")
+            return
+        if not HAS_OPENPYXL:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "openpyxl не установлен.")
+            return
+        filename, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Импорт", "", "Excel Files (*.xlsx)"
+        )
+        if filename:
+            wb = load_workbook(filename)
+            ws = wb.active
+            rows = list(ws.iter_rows(values_only=True))
+            if not rows:
+                return
+            headers = [str(cell).strip().lower() if cell else "" for cell in rows[0]]
+            interval_is_minutes = "ping_interval_min" in headers
+            for row in rows[1:]:
+                if row and len(row) >= 2:
+                    addr = row[0]
+                    desc = row[1]
+                    sub = row[2] if len(row) > 2 else None
+                    interval_value = (
+                        int(row[3]) if len(row) > 3 and row[3] else self.default_interval_seconds
+                    )
+                    interval_sec = interval_value * 60 if interval_is_minutes else interval_value
+                    if addr:
+                        self.db.add_host(self.current_group, addr, desc, sub, interval_sec)
+            self.refresh_table()
+
+    def on_host_select(self):
+        selected_items = self.host_table.selectedItems()
+        if not selected_items:
+            return
+        address = selected_items[1].text()
         self.selected_host = (self.current_group, address)
         self.update_detail_panel(address)
         self.update_chart()
@@ -1553,44 +1302,48 @@ class PingApp(tk.Tk):
             diffs = [abs(latencies[i] - latencies[i - 1]) for i in range(1, len(latencies))]
             jitter = sum(diffs) / len(diffs)
 
-        self.detail_vars["address"].set(address)
-        self.detail_vars["description"].set(desc or "—")
-        self.detail_vars["subgroup"].set(subgroup or "—")
+        self.detail_labels["Адрес"].setText(address)
+        self.detail_labels["Описание"].setText(desc or "—")
+        self.detail_labels["Подгруппа"].setText(subgroup or "—")
         interval_value = interval_sec if interval_sec else self.default_interval_seconds
-        self.detail_vars["interval"].set(f"{interval_value} сек")
-        self.detail_vars["status"].set(status)
-        self.detail_vars["latency"].set(
+        self.detail_labels["Интервал"].setText(f"{interval_value} сек")
+        self.detail_labels["Статус"].setText(status)
+        self.detail_labels["Задержка"].setText(
             f"{latest_latency * 1000:.0f} мс" if latest_latency else "—"
         )
-        self.detail_vars["last_check"].set(last_ping_time or "—")
+        self.detail_labels["Последняя проверка"].setText(last_ping_time or "—")
         if last_status and last_change_time:
-            self.detail_vars["status_change"].set(
+            self.detail_labels["Последняя смена"].setText(
                 f"{last_status} в {last_change_time}"
             )
         else:
-            self.detail_vars["status_change"].set("—")
+            self.detail_labels["Последняя смена"].setText("—")
 
         if latencies:
-            self.detail_vars["min_latency"].set(f"{min(latencies) * 1000:.0f} мс")
-            self.detail_vars["max_latency"].set(f"{max(latencies) * 1000:.0f} мс")
-            self.detail_vars["avg_latency"].set(
+            self.metric_labels["min"].setText(f"{min(latencies) * 1000:.0f} мс")
+            self.metric_labels["max"].setText(f"{max(latencies) * 1000:.0f} мс")
+            self.metric_labels["avg"].setText(
                 f"{(sum(latencies) / len(latencies)) * 1000:.0f} мс"
             )
         else:
-            self.detail_vars["min_latency"].set("—")
-            self.detail_vars["max_latency"].set("—")
-            self.detail_vars["avg_latency"].set("—")
+            self.metric_labels["min"].setText("—")
+            self.metric_labels["max"].setText("—")
+            self.metric_labels["avg"].setText("—")
 
-        self.detail_vars["jitter"].set(
+        self.metric_labels["jitter"].setText(
             f"{jitter * 1000:.0f} мс" if jitter is not None else "—"
         )
         if total_count > 0:
-            self.detail_vars["loss"].set(f"{(loss_count / total_count) * 100:.1f}%")
+            self.metric_labels["loss"].setText(f"{(loss_count / total_count) * 100:.1f}%")
         else:
-            self.detail_vars["loss"].set("—")
+            self.metric_labels["loss"].setText("—")
+
+    def clear_chart(self):
+        self.chart.removeAllSeries()
+        self.chart.createDefaultAxes()
 
     def update_chart(self):
-        self.chart_canvas.delete("all")
+        self.chart.removeAllSeries()
         if not self.selected_host:
             return
         group, address = self.selected_host
@@ -1598,116 +1351,66 @@ class PingApp(tk.Tk):
         if not data:
             return
 
+        line_series = QLineSeries()
+        point_series = QScatterSeries()
+        point_series.setMarkerSize(6.0)
+        offline_series = QScatterSeries()
+        offline_series.setMarkerSize(8.0)
+        offline_series.setColor(QtCore.Qt.red)
+
+        x_values = list(range(len(data)))
         latencies_ms = [row[2] * 1000 for row in data if row[2] is not None]
-        width = self.chart_canvas.winfo_width() or 300
-        height = self.chart_canvas.winfo_height() or 220
-        padding = 28
+        min_latency = min(latencies_ms) if latencies_ms else 0
+        max_latency = max(latencies_ms) if latencies_ms else 1
 
-        if latencies_ms:
-            min_latency = min(latencies_ms)
-            max_latency = max(latencies_ms)
-        else:
-            min_latency = 0
-            max_latency = 1
-
-        span = max(max_latency - min_latency, 1)
-
-        self.chart_canvas.create_rectangle(
-            0, 0, width, height, fill="#0b0f15", outline=""
-        )
-
-        for i in range(5):
-            y = padding + i * (height - 2 * padding) / 4
-            self.chart_canvas.create_line(
-                padding, y, width - padding, y, fill="#1f2937"
-            )
-
-        for i in range(5):
-            x = padding + i * (width - 2 * padding) / 4
-            self.chart_canvas.create_line(
-                x, padding, x, height - padding, fill="#1f2937"
-            )
-
-        points = []
-        for idx, (timestamp, status, latency) in enumerate(data):
-            x = padding + idx * (width - 2 * padding) / max(len(data) - 1, 1)
+        for idx, (_, status, latency) in enumerate(data):
             if latency is None:
-                y = height - padding
-                self.chart_canvas.create_line(
-                    x - 4, y - 4, x + 4, y + 4, fill="#ef4444", width=2
-                )
-                self.chart_canvas.create_line(
-                    x - 4, y + 4, x + 4, y - 4, fill="#ef4444", width=2
-                )
-                points.append(None)
+                offline_series.append(idx, min_latency)
                 continue
-
             latency_ms = latency * 1000
-            y = height - padding - (latency_ms - min_latency) / span * (
-                height - 2 * padding
-            )
-            points.append((x, y))
-            self.chart_canvas.create_oval(
-                x - 2, y - 2, x + 2, y + 2, fill="#f9fafb", outline=""
-            )
+            line_series.append(idx, latency_ms)
+            point_series.append(idx, latency_ms)
 
-            if idx in (0, len(data) - 1) or idx % max(len(data) // 4, 1) == 0:
-                time_label = timestamp.split(" ")[-1]
-                self.chart_canvas.create_text(
-                    x,
-                    height - padding + 12,
-                    text=time_label,
-                    fill="#9ca3af",
-                    font=("Segoe UI", 7),
-                )
+        self.chart.addSeries(line_series)
+        self.chart.addSeries(point_series)
+        self.chart.addSeries(offline_series)
 
-        segment = []
-        for point in points:
-            if point is None:
-                if len(segment) >= 4:
-                    self.chart_canvas.create_line(
-                        segment, fill="#60a5fa", width=2, smooth=True
-                    )
-                segment = []
-            else:
-                segment.extend(point)
-        if len(segment) >= 4:
-            self.chart_canvas.create_line(
-                segment, fill="#60a5fa", width=2, smooth=True
-            )
+        axis_x = QValueAxis()
+        axis_x.setRange(0, max(len(data) - 1, 1))
+        axis_x.setTickCount(5)
+        axis_x.setLabelFormat("%d")
+        axis_x.setTitleText("Точки")
 
-        self.chart_canvas.create_text(
-            padding,
-            padding - 10,
-            text=f"{max_latency:.0f} мс",
-            fill="#9ca3af",
-            anchor="w",
-            font=("Segoe UI", 8),
-        )
-        self.chart_canvas.create_text(
-            padding,
-            height - padding + 2,
-            text=f"{min_latency:.0f} мс",
-            fill="#9ca3af",
-            anchor="w",
-            font=("Segoe UI", 8),
-        )
+        axis_y = QValueAxis()
+        axis_y.setRange(min_latency, max_latency if max_latency > min_latency else min_latency + 1)
+        axis_y.setLabelFormat("%d")
+        axis_y.setTitleText("мс")
+
+        self.chart.addAxis(axis_x, QtCore.Qt.AlignBottom)
+        self.chart.addAxis(axis_y, QtCore.Qt.AlignLeft)
+        line_series.attachAxis(axis_x)
+        line_series.attachAxis(axis_y)
+        point_series.attachAxis(axis_x)
+        point_series.attachAxis(axis_y)
+        offline_series.attachAxis(axis_x)
+        offline_series.attachAxis(axis_y)
 
     def toggle_monitoring(self):
         if self.monitoring:
             self.monitoring = False
-            self.btn_start.configure(text="Старт")
-            self.status_var.set("Мониторинг остановлен")
+            self.btn_start.setText("Старт")
+            self.status_label.setText("Мониторинг остановлен")
         else:
             if not self.db.get_active_groups():
-                messagebox.showwarning(
+                QtWidgets.QMessageBox.warning(
+                    self,
                     "Внимание",
                     "Нет активных групп для мониторинга. Включите группы на вкладке 'Статистика'.",
                 )
                 return
             self.monitoring = True
-            self.btn_start.configure(text="Стоп")
-            self.status_var.set("Мониторинг запущен...")
+            self.btn_start.setText("Стоп")
+            self.status_label.setText("Мониторинг запущен...")
             self.monitor_thread = threading.Thread(target=self.monitoring_loop, daemon=True)
             self.monitor_thread.start()
 
@@ -1773,8 +1476,8 @@ class PingApp(tk.Tk):
             for group in groups:
                 hosts = self.db.get_hosts(group)
                 for host in hosts:
-                    address, desc, subgroup, interval_sec, last_ping_time, _ = host
-                    interval_sec = interval_sec or DEFAULT_PING_INTERVAL
+                    address, _, subgroup, interval_sec, last_ping_time, _ = host
+                    interval_sec = interval_sec or self.default_interval_seconds
                     if self.is_due(last_ping_time, interval_sec, now):
                         due_hosts.append((group, address, subgroup))
 
@@ -1785,14 +1488,16 @@ class PingApp(tk.Tk):
                     results = self.ping_hosts_batch(batch)
                     self.db.log_results_batch(results)
                     for result in results:
-                        self.ui_queue.put({
-                            "type": "row",
-                            "group": result["group_name"],
-                            "address": result["address"],
-                            "status": result["status"],
-                            "latency": result["latency"],
-                            "timestamp": result["timestamp"],
-                        })
+                        self.ui_queue.put(
+                            {
+                                "type": "row",
+                                "group": result["group_name"],
+                                "address": result["address"],
+                                "status": result["status"],
+                                "latency": result["latency"],
+                                "timestamp": result["timestamp"],
+                            }
+                        )
 
             now_ts = time.time()
             if now_ts - self.last_stats_refresh >= STATS_REFRESH_INTERVAL:
@@ -1805,62 +1510,48 @@ class PingApp(tk.Tk):
     def update_row(self, group, address, status, latency, timestamp):
         if self.current_group != group:
             return
-        for item_id in self.tree.get_children():
-            vals = self.tree.item(item_id)["values"]
-            if vals and str(vals[1]) == str(address):
-                offline_since = self.host_status_cache.get(address, ("Unknown", None))[1]
-                if status == "Offline" and offline_since is None:
-                    offline_since = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                elif status == "Online":
-                    offline_since = None
+        row = self.host_row_map.get(address)
+        if row is None:
+            return
 
-                self.host_status_cache[address] = (status, offline_since)
+        offline_since = self.host_status_cache.get(address, ("Unknown", None))[1]
+        if status == "Offline" and offline_since is None:
+            offline_since = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        elif status == "Online":
+            offline_since = None
 
-                color = self.get_status_color(address)
-                tag = f"status_{color}"
+        self.host_status_cache[address] = (status, offline_since)
+        latency_str = f"{latency * 1000:.0f}" if latency else "-"
 
-                indicator = "●"
-                latency_str = f"{latency * 1000:.0f}" if latency else "-"
-                new_vals = (
-                    indicator,
-                    vals[1],
-                    vals[2],
-                    vals[3],
-                    vals[4],
-                    latency_str,
-                    timestamp,
-                )
-                self.tree.item(item_id, values=new_vals, tags=(tag,))
-                break
+        self.host_table.setItem(row, 5, QtWidgets.QTableWidgetItem(latency_str))
+        self.host_table.setItem(row, 6, QtWidgets.QTableWidgetItem(timestamp))
 
         if self.selected_host == (group, address):
             self.update_detail_panel(address)
             self.update_chart()
 
     def process_ui_queue(self):
-        try:
-            while True:
+        while True:
+            try:
                 event = self.ui_queue.get_nowait()
-                if event["type"] == "row":
-                    self.update_row(
-                        event["group"],
-                        event["address"],
-                        event["status"],
-                        event["latency"],
-                        event["timestamp"],
-                    )
-                elif event["type"] == "stats":
-                    selected = self.notebook.select()
-                    if self.notebook.tab(selected, "text") == "Статистика":
-                        self.refresh_stats()
-                elif event["type"] == "overall":
-                    self.update_overall_status()
-        except queue.Empty:
-            pass
-        finally:
-            self.after(200, self.process_ui_queue)
+            except queue.Empty:
+                break
+            if event["type"] == "row":
+                self.update_row(
+                    event["group"],
+                    event["address"],
+                    event["status"],
+                    event["latency"],
+                    event["timestamp"],
+                )
+            elif event["type"] == "stats":
+                self.refresh_stats()
+            elif event["type"] == "overall":
+                self.update_overall_status()
 
 
 if __name__ == "__main__":
-    app = PingApp()
-    app.mainloop()
+    app = QtWidgets.QApplication([])
+    window = PingApp()
+    window.show()
+    app.exec()
